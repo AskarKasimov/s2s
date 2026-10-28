@@ -22,6 +22,7 @@ MAX_FILE_BYTES = 10 * 1024**2
 MAX_BODY_BYTES = MAX_FILE_BYTES + 1024**2
 MAX_SECONDS = 30
 MAX_CHAT_BODY_BYTES = 128 * 1024
+MAX_CONCURRENT_REQUESTS = int(os.getenv("S2S_MAX_CONCURRENT", "4"))
 
 
 class ChatMessage(BaseModel):
@@ -81,22 +82,23 @@ async def normalize_audio(data):
 
 
 class AdmissionMiddleware:
-    """Share one generation slot across text/speech and bound request bodies."""
+    """Allow up to max_concurrent generation slots across text/speech and bound request bodies."""
 
-    def __init__(self, app, rejected):
+    def __init__(self, app, rejected, max_concurrent=MAX_CONCURRENT_REQUESTS):
         self.app, self.rejected = app, rejected
-        self.busy = False
+        self.max_concurrent = max_concurrent
+        self.active = 0
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["path"] not in self.rejected or scope["method"] != "POST":
             return await self.app(scope, receive, send)
         counter = self.rejected[scope["path"]]
         limit = MAX_CHAT_BODY_BYTES if scope["path"] == "/chat" else MAX_BODY_BYTES
-        if self.busy:
+        if self.active >= self.max_concurrent:
             counter.labels(outcome="busy").inc()
             return await JSONResponse({"detail": "Модель занята. Повторите запрос позже."}, 429,
                                       headers={"Retry-After": "5"})(scope, receive, send)
-        self.busy = True
+        self.active += 1
         try:
             body = bytearray()
             while True:
@@ -121,10 +123,10 @@ class AdmissionMiddleware:
 
             await self.app(scope, replay, send)
         finally:
-            self.busy = False
+            self.active -= 1
 
 
-def create_app(*, transport=None, normalizer=normalize_audio):
+def create_app(*, transport=None, normalizer=normalize_audio, max_concurrent=MAX_CONCURRENT_REQUESTS):
     registry = CollectorRegistry()
     requests = Counter("speech_requests_total", "Speech requests by outcome", ["outcome"], registry=registry)
     duration = Histogram("speech_request_duration_seconds", "Speech request time", registry=registry)
@@ -139,7 +141,11 @@ def create_app(*, transport=None, normalizer=normalize_audio):
             yield
 
     app = FastAPI(title="Qwen3-Omni Speech-to-Speech", lifespan=lifespan)
-    app.add_middleware(AdmissionMiddleware, rejected={"/speech-to-speech": requests, "/chat": text_requests})
+    app.add_middleware(
+        AdmissionMiddleware,
+        rejected={"/speech-to-speech": requests, "/chat": text_requests},
+        max_concurrent=max_concurrent,
+    )
 
     @app.get("/health")
     async def health():

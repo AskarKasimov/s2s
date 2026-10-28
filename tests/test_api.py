@@ -175,23 +175,31 @@ class ApiTests(unittest.TestCase):
     def test_busy_admission_and_release(self):
         async def check():
             entered, release = asyncio.Event(), asyncio.Event()
+            in_flight = 0
 
             async def normalizer(data):
-                entered.set()
+                nonlocal in_flight
+                in_flight += 1
+                if in_flight == 4:
+                    entered.set()
                 await release.wait()
                 return data
 
             app = create_app(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply())), normalizer=normalizer)
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
-                    first = asyncio.create_task(client.post("/speech-to-speech", files={"file": ("q.wav", audio())}))
+                    tasks = [
+                        asyncio.create_task(client.post("/speech-to-speech", files={"file": ("q.wav", audio())}))
+                        for _ in range(4)
+                    ]
                     await asyncio.wait_for(entered.wait(), 5)
-                    second = await client.post("/speech-to-speech", files={"file": ("q.wav", audio())})
-                    self.assertEqual(second.status_code, 429)
+                    fifth = await client.post("/speech-to-speech", files={"file": ("q.wav", audio())})
+                    self.assertEqual(fifth.status_code, 429)
                     self.assertEqual((await client.post("/chat", json={"messages": [{"role": "user", "content": "Тест"}]})).status_code, 429)
                     self.assertEqual((await client.get("/health")).status_code, 200)
                     release.set()
-                    self.assertEqual((await first).status_code, 200)
+                    for task in tasks:
+                        self.assertEqual((await task).status_code, 200)
                     self.assertEqual((await client.post("/speech-to-speech", files={"file": ("q.wav", audio())})).status_code, 200)
 
         asyncio.run(check())
@@ -205,7 +213,7 @@ class ApiTests(unittest.TestCase):
                 await release.wait()
                 return httpx.Response(200, json={"choices": [{"message": {"content": "Ответ"}}]})
 
-            app = create_app(transport=httpx.MockTransport(engine))
+            app = create_app(transport=httpx.MockTransport(engine), max_concurrent=1)
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
                     first = asyncio.create_task(client.post("/chat", json={"messages": [{"role": "user", "content": "Тест"}]}))
