@@ -175,6 +175,62 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(st_resp.status_code, 400)
         self.assertEqual(st_resp.json()["error"]["code"], "UNSUPPORTED_PARAMETER")
 
+        # Unknown model name rejected with 400 UNSUPPORTED_PARAMETER
+        bad_model = client.post("/v1/chat/completions", json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Привет"}],
+        })
+        self.assertEqual(bad_model.status_code, 400)
+        self.assertEqual(bad_model.json()["error"]["code"], "UNSUPPORTED_PARAMETER")
+
+        # Internal alias returns canonical model ID
+        alias_resp = client.post("/v1/chat/completions", json={
+            "model": "qwen3-omni-speech",
+            "messages": [{"role": "user", "content": "Привет"}],
+        })
+        self.assertEqual(alias_resp.status_code, 200)
+        self.assertEqual(alias_resp.json()["model"], "Qwen/Qwen3-Omni-30B-A3B-Instruct")
+
+    def test_legacy_chat_response_format_and_model_validation(self):
+        seen_messages = []
+        return_text = '```json\n{"score": 5}\n```'
+
+        def engine(request):
+            payload = json.loads(request.content)
+            seen_messages.append(payload["messages"])
+            return httpx.Response(200, json={
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": return_text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            })
+
+        client = self.client(engine)
+        ok_resp = client.post("/chat", json={
+            "messages": [{"role": "user", "content": "Оцени ответ"}],
+            "response_format": "json_object",
+        })
+        self.assertEqual(ok_resp.status_code, 200)
+        body = ok_resp.json()
+        self.assertEqual(body["model"], "Qwen/Qwen3-Omni-30B-A3B-Instruct")
+        self.assertEqual(json.loads(body["text"]), {"score": 5})
+        self.assertTrue(any("JSON-объектом" in m["content"] for m in seen_messages[-1] if m["role"] == "system"))
+
+        # Invalid JSON returned by engine in json_object mode triggers 502 INVALID_MODEL_OUTPUT
+        return_text = "Произвольный текст без JSON"
+        bad_json_resp = client.post("/chat", json={
+            "messages": [{"role": "user", "content": "Оцени ответ"}],
+            "response_format": "json_object",
+        })
+        self.assertEqual(bad_json_resp.status_code, 502)
+        self.assertEqual(bad_json_resp.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+        # Unknown model in /chat rejected with 400 UNSUPPORTED_PARAMETER
+        bad_model_chat = client.post("/chat", json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Привет"}],
+        })
+        self.assertEqual(bad_model_chat.status_code, 400)
+        self.assertEqual(bad_model_chat.json()["error"]["code"], "UNSUPPORTED_PARAMETER")
+
     def test_analyze_audio_json_and_text_modes(self):
         def engine(request):
             return httpx.Response(200, json={

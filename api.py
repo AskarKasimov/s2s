@@ -200,6 +200,17 @@ def validate_speaker(speaker: str | None) -> str:
     return normalized
 
 
+def validate_model_name(model: str) -> str:
+    normalized = model.strip() if isinstance(model, str) else ""
+    if normalized not in SUPPORTED_MODELS:
+        raise ApiError(
+            400,
+            "UNSUPPORTED_PARAMETER",
+            f"Неподдерживаемая модель '{model}'. Допустимы: {', '.join(sorted(SUPPORTED_MODELS))}.",
+        )
+    return CANONICAL_MODEL_ID
+
+
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: Literal["system", "user", "assistant"]
@@ -231,6 +242,7 @@ class ChatCompletionRequestModel(BaseModel):
 
     @model_validator(mode="after")
     def validate_contract(self):
+        self.model = validate_model_name(self.model)
         if self.reasoning_effort is not None:
             raise ApiError(
                 400,
@@ -266,6 +278,7 @@ class ChatCompletionRequestModel(BaseModel):
 
 class LegacyChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    model: str = CANONICAL_MODEL_ID
     messages: list[ChatMessage] = Field(min_length=1, max_length=64)
     max_tokens: int = Field(default=256, ge=1, le=4096, strict=True)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, allow_inf_nan=False)
@@ -273,9 +286,18 @@ class LegacyChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def bound_history(self):
+        self.model = validate_model_name(self.model)
         if sum(len(message.content) for message in self.messages) > 48000:
             raise ValueError("История превышает 48 000 символов.")
         return self
+
+    @property
+    def response_format_type(self) -> Literal["text", "json_object"]:
+        if self.response_format is None:
+            return "text"
+        if isinstance(self.response_format, str):
+            return self.response_format
+        return self.response_format.type
 
 
 class SynthesizeRequest(BaseModel):
@@ -642,7 +664,7 @@ def create_app(
                     "UNSUPPORTED_PARAMETER",
                     f"Неподдерживаемый параметр '{field_name}'.",
                 )
-            if "speaker" in loc or "modalities" in loc or "stream" in loc or "reasoning_effort" in loc:
+            if any(field in loc for field in ("speaker", "modalities", "stream", "reasoning_effort", "model", "response_format")):
                 return error_response(
                     make_request_id(request),
                     400,
@@ -947,7 +969,7 @@ def create_app(
             return {
                 "id": result.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}",
                 "object": "chat.completion",
-                "model": body.model,
+                "model": CANONICAL_MODEL_ID,
                 "choices": [
                     {
                         "index": 0,
@@ -969,24 +991,51 @@ def create_app(
     async def legacy_chat(request: Request, body: LegacyChatRequest):
         started, outcome = time.perf_counter(), "error"
         try:
+            messages = [message.model_dump() for message in body.messages]
+            if body.response_format_type == "json_object":
+                messages = [
+                    *messages,
+                    {
+                        "role": "system",
+                        "content": "Ответ должен быть строго валидным JSON-объектом без Markdown-обёртки ```json.",
+                    },
+                ]
             payload = {
                 "model": MODEL,
                 "modalities": ["text"],
                 "stream": False,
-                "messages": [message.model_dump() for message in body.messages],
+                "messages": messages,
                 "max_tokens": body.max_tokens,
                 "temperature": body.temperature,
             }
             async with generation_slot():
                 result = await call_engine(request, payload)
             try:
-                text = result["choices"][0]["message"]["content"]
+                choice = result["choices"][0]
+                text = choice["message"]["content"]
+                finish_reason = str(choice.get("finish_reason") or "stop")
             except (KeyError, IndexError, TypeError) as error:
                 raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок не вернул корректный текстовый ответ.") from error
             if not isinstance(text, str) or not text.strip():
                 raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок вернул пустой текстовый ответ.")
+
+            if body.response_format_type == "json_object":
+                cleaned_text = strip_markdown_json(text)
+                if finish_reason != "length":
+                    parsed_obj = parse_json_object(
+                        cleaned_text,
+                        error_message="В режиме json_object модель вернула невалидный JSON.",
+                    )
+                    text = json.dumps(parsed_obj, ensure_ascii=False)
+                else:
+                    text = cleaned_text
+
             outcome = "success"
-            answer: dict[str, Any] = {"text": text, "model": MODEL}
+            answer: dict[str, Any] = {
+                "text": text,
+                "model": CANONICAL_MODEL_ID,
+                "finish_reason": finish_reason,
+            }
             if isinstance(result.get("usage"), dict):
                 answer["usage"] = result["usage"]
             return answer
