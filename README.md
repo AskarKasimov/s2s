@@ -5,28 +5,51 @@ HTTP API распознавания речи, синтеза, анализа у�
 
 Используется квантованный checkpoint [`Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound`](https://huggingface.co/Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound), ревизия `c3ef7bbf0b9d866866136c1d08b6314d27f7e151`, и движок [`vllm-project/vllm-omni`](https://github.com/vllm-project/vllm-omni), коммит `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`. Полный контракт запросов и ответов описан в [API.md](API.md).
 
-## Запуск на сервере с NVIDIA GPU
+## Пошаговое развёртывание на сервере с NVIDIA GPU
 
 Для запуска нужны Linux `x86_64`, видеокарта NVIDIA 80 ГБ (A100 или H100, не менее 72 ГиБ свободной VRAM, MIG отключён), драйвер NVIDIA `580.95.05+`, Docker с NVIDIA Container Toolkit и от 80 ГиБ свободного места на диске.
 
-Запуск из корня репозитория:
+### Шаг 1. Клонирование и настройка `.env`
 
 ```bash
+git clone https://github.com/AskarKasimov/s2s.git
+cd s2s
+git checkout feat/qwen3-omni-speech-to-speech
 cp -n .env.example .env
-./run.sh check
-./run.sh install
 ```
 
-`./run.sh install` собирает образ, скачивает 26,3 ГиБ весов в `./data` с проверкой SHA-256 всех 13 шардов, поднимает контейнеры `omni` и `api` и прогоняет тестовые запросы. Первый запуск занимает 15–30 минут; чтобы процесс не прервался при разрыве SSH, запускайте его в фоне:
+По умолчанию используется `GPU_ID=0`, внешний порт API — `8002`, каталог весов — `./data`. При необходимости измените `GPU_ID`, `S2S_API_PORT`, `S2S_DATA_DIR` или добавьте `HF_TOKEN` в `.env`.
+
+### Шаг 2. Предпусковая проверка сервера
+
+```bash
+./run.sh check
+```
+
+Возможные ошибки на этом этапе и их решение:
+- **`Драйвер ... слишком старый. Для выбранного CUDA 13 стека нужен 580.95.05 или новее`** — обновите драйвер NVIDIA на хосте (`sudo apt-get update && sudo apt-get install -y nvidia-driver-580-server && sudo reboot`).
+- **`На GPU включён MIG`** — отключите MIG: `sudo nvidia-smi -mig 0 && sudo reboot`.
+- **`Для запуска Qwen3-Omni на чистой GPU нужно не менее 72.0 GiB свободной VRAM`** — видеокарта занята другими процессами. Проверьте `nvidia-smi` и `docker ps`, остановите лишние контейнеры или укажите индекс другой свободной 80 ГБ карты в `GPU_ID` внутри `.env`.
+- **`На общем диске весов и Docker нужно 80 GiB свободно`** — освободите место (`docker system prune -af`) или укажите путь к другому диску в `S2S_DATA_DIR` в `.env`.
+- **`Порт 8002 (или 8091) занят`** — проверьте, не запущен ли уже сервис (`./run.sh status`), либо поменяйте `S2S_API_PORT` / `S2S_PORT` в `.env`.
+
+### Шаг 3. Сборка, скачивание весов и запуск
+
+`./run.sh install` собирает образ, скачивает 26,3 ГиБ весов в `./data` с проверкой SHA-256 всех 13 шардов, поднимает контейнеры `omni` и `api` и прогоняет контрольные запросы. Первый запуск занимает 15–30 минут; чтобы процесс не оборвался при разрыве SSH, запускайте его в фоне:
 
 ```bash
 nohup ./run.sh install > install.log 2>&1 &
 tail -f install.log
 ```
 
-По умолчанию используется `GPU_ID=0`, внешний порт API — `8002`. При необходимости задайте `GPU_ID`, `S2S_API_PORT`, `S2S_DATA_DIR` или `HF_TOKEN` в `.env`.
+Возможные ошибки на этом этапе и их решение:
+- **`could not select device driver "nvidia" with capabilities: [[gpu]]`** — Docker не видит GPU. Установите и настройте `nvidia-container-toolkit`: `sudo apt-get install -y nvidia-container-toolkit && sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`.
+- **Обрыв скачивания весов или `HTTP 429` от Hugging Face** — добавьте токен `HF_TOKEN=hf_...` в `.env` и запустите `./run.sh install` повторно (скачанные шарды в `data/` сохраняются, загрузка продолжится с места остановки).
+- **`Контейнер omni не стал healthy` или упал при старте** — соберите диагностику через `./run.sh doctor` и проверьте конец лога `reports/omni.log`.
 
-Проверка после запуска:
+### Шаг 4. Проверка работы и управление сервисом
+
+Проверка готовности после запуска:
 
 ```bash
 curl http://localhost:8002/health/live
@@ -34,7 +57,7 @@ curl http://localhost:8002/health/ready
 curl http://localhost:8002/capabilities
 ```
 
-Управление сервисом:
+Команды управления из корня репозитория:
 
 ```bash
 ./run.sh status   # статус контейнеров и память GPU
@@ -47,7 +70,7 @@ curl http://localhost:8002/capabilities
 
 ## Ручки HTTP API
 
-Все ручки работают через один запущенный экземпляр модели (до 4 параллельных генераций одновременно). Входное аудио: WAV, Ogg/Opus, WebM/Opus, MP3, FLAC до 25 МиБ и до 90 секунд. Подробные схемы — в [API.md](API.md), Swagger UI — `http://<адрес-сервера>:8002/docs`.
+Все ручки работают через один запущенный экземпляр модели (до 4 параллельных генераций одновременно; при превышении возвращается `429 QUEUE_FULL` с заголовком `Retry-After: 5`). Входное аудио: WAV, Ogg/Opus, WebM/Opus, MP3, FLAC до 25 МиБ и до 90 секунд. Подробные схемы — в [API.md](API.md), Swagger UI — `http://<адрес-сервера>:8002/docs`.
 
 ### Распознавание: `POST /transcribe`
 
