@@ -37,6 +37,8 @@ MAX_SECONDS = 90
 MAX_SYNTHESIZE_CHARS = 500
 MAX_CHAT_BODY_BYTES = 512 * 1024
 MAX_CONCURRENT_REQUESTS = int(os.getenv("S2S_MAX_CONCURRENT", "4"))
+MAX_INFLIGHT_REQUESTS = int(os.getenv("S2S_MAX_INFLIGHT_REQUESTS", str(max(MAX_CONCURRENT_REQUESTS * 4, 16))))
+BODY_READ_TIMEOUT = float(os.getenv("S2S_BODY_READ_TIMEOUT", "30.0"))
 
 TRANSCRIBE_SYSTEM_PROMPT = (
     "Ты система дословного распознавания речи (STT). "
@@ -449,12 +451,19 @@ async def post_with_disconnect_cancel(request: Request, client: httpx.AsyncClien
 
 
 class AdmissionMiddleware:
-    """Allow up to max_concurrent generation slots, attach X-Request-ID, and bound request bodies."""
+    """Bound concurrent incoming body reads, enforce a body read timeout, attach X-Request-ID, and bound body size."""
 
-    def __init__(self, app, rejected, max_concurrent=MAX_CONCURRENT_REQUESTS):
+    def __init__(
+        self,
+        app,
+        rejected,
+        max_inflight: int = MAX_INFLIGHT_REQUESTS,
+        body_read_timeout: float = BODY_READ_TIMEOUT,
+    ):
         self.app, self.rejected = app, rejected
-        self.max_concurrent = max_concurrent
-        self.active = 0
+        self.max_inflight = max_inflight
+        self.body_read_timeout = body_read_timeout
+        self.inflight = 0
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -480,40 +489,64 @@ class AdmissionMiddleware:
         is_json_route = path in ("/chat", "/v1/chat/completions", "/synthesize")
         limit = MAX_CHAT_BODY_BYTES if is_json_route else MAX_BODY_BYTES
 
-        if self.active >= self.max_concurrent:
+        if self.inflight >= self.max_inflight:
             counter.labels(outcome="busy").inc()
             response = error_response(
                 request_id,
                 429,
                 "QUEUE_FULL",
-                "Все слоты генерации заняты. Повторите запрос позже.",
+                "Слишком много одновременных входящих запросов. Повторите запрос позже.",
                 retryable=True,
                 headers={"Retry-After": "5"},
             )
             return await response(scope, receive, send_with_request_id)
 
-        self.active += 1
+        self.inflight += 1
         try:
             body = bytearray()
-            while True:
-                message = await receive()
-                if message["type"] == "http.disconnect":
-                    return
-                chunk = message.get("body", b"")
-                if len(body) + len(chunk) > limit:
-                    counter.labels(outcome="too_large").inc()
-                    code = "INVALID_REQUEST" if is_json_route else "AUDIO_TOO_LARGE"
-                    response = error_response(
-                        request_id,
-                        413,
-                        code,
-                        "Превышен максимальный размер тела запроса.",
-                        retryable=False,
-                    )
-                    return await response(scope, receive, send_with_request_id)
-                body.extend(chunk)
-                if not message.get("more_body", False):
-                    break
+            too_large = False
+
+            async def read_body() -> bool:
+                nonlocal too_large
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return False
+                    chunk = message.get("body", b"")
+                    if len(body) + len(chunk) > limit:
+                        too_large = True
+                        return True
+                    body.extend(chunk)
+                    if not message.get("more_body", False):
+                        return True
+
+            try:
+                completed = await asyncio.wait_for(read_body(), timeout=self.body_read_timeout)
+            except asyncio.TimeoutError:
+                counter.labels(outcome="timeout").inc()
+                response = error_response(
+                    request_id,
+                    408,
+                    "INVALID_REQUEST",
+                    "Превышено время ожидания загрузки тела запроса.",
+                    retryable=True,
+                )
+                return await response(scope, receive, send_with_request_id)
+
+            if not completed:
+                return
+            if too_large:
+                counter.labels(outcome="too_large").inc()
+                code = "INVALID_REQUEST" if is_json_route else "AUDIO_TOO_LARGE"
+                response = error_response(
+                    request_id,
+                    413,
+                    code,
+                    "Превышен максимальный размер тела запроса.",
+                    retryable=False,
+                )
+                return await response(scope, receive, send_with_request_id)
+
             replayed = False
 
             async def replay():
@@ -525,16 +558,42 @@ class AdmissionMiddleware:
 
             await self.app(scope, replay, send_with_request_id)
         finally:
-            self.active -= 1
+            self.inflight -= 1
 
 
-def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_concurrent=MAX_CONCURRENT_REQUESTS):
+def create_app(
+    *,
+    transport=None,
+    normalizer=normalize_audio_with_info,
+    max_concurrent: int = MAX_CONCURRENT_REQUESTS,
+    max_inflight: int | None = None,
+    body_read_timeout: float = BODY_READ_TIMEOUT,
+):
+    effective_max_inflight = max_inflight if max_inflight is not None else max(max_concurrent * 4, MAX_INFLIGHT_REQUESTS)
     registry = CollectorRegistry()
     speech_requests = Counter("speech_requests_total", "Speech requests by outcome", ["outcome"], registry=registry)
     speech_duration = Histogram("speech_request_duration_seconds", "Speech request time", registry=registry)
     text_requests = Counter("text_requests_total", "Text requests by outcome", ["outcome"], registry=registry)
     text_duration = Histogram("text_request_duration_seconds", "Text request time", registry=registry)
     engine_url = os.getenv("OMNI_URL", "http://omni:8091").rstrip("/")
+    active_generations = 0
+
+    @asynccontextmanager
+    async def generation_slot():
+        nonlocal active_generations
+        if active_generations >= max_concurrent:
+            raise ApiError(
+                429,
+                "QUEUE_FULL",
+                "Все слоты генерации заняты. Повторите запрос позже.",
+                retryable=True,
+                headers={"Retry-After": "5"},
+            )
+        active_generations += 1
+        try:
+            yield
+        finally:
+            active_generations -= 1
 
     @asynccontextmanager
     async def lifespan(app):
@@ -553,7 +612,8 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
             "/chat": text_requests,
             "/v1/chat/completions": text_requests,
         },
-        max_concurrent=max_concurrent,
+        max_inflight=effective_max_inflight,
+        body_read_timeout=body_read_timeout,
     )
 
     @app.exception_handler(ApiError)
@@ -724,7 +784,8 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                     },
                 ],
             }
-            result = await call_engine(request, payload)
+            async with generation_slot():
+                result = await call_engine(request, payload)
             try:
                 text = result["choices"][0]["message"]["content"]
             except (KeyError, IndexError, TypeError) as error:
@@ -737,6 +798,10 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                 "language": lang,
                 "duration_seconds": round(float(audio_info["seconds"]), 2),
             }
+        except ApiError as exc:
+            if exc.code == "QUEUE_FULL":
+                outcome = "busy"
+            raise
         finally:
             await file.close()
             speech_requests.labels(outcome=outcome).inc()
@@ -758,7 +823,8 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                     {"role": "user", "content": f"<read>{body.text}</read>"},
                 ],
             }
-            result = await call_engine(request, payload)
+            async with generation_slot():
+                result = await call_engine(request, payload)
             try:
                 _, raw_audio, _ = decode_reply(result)
             except (ValueError, RuntimeError, wave.Error, EOFError, KeyError, TypeError) as error:
@@ -780,6 +846,10 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                 media_type="audio/wav",
                 headers={"Content-Disposition": 'attachment; filename="synthesized.wav"'},
             )
+        except ApiError as exc:
+            if exc.code == "QUEUE_FULL":
+                outcome = "busy"
+            raise
         finally:
             speech_requests.labels(outcome=outcome).inc()
             speech_duration.observe(time.perf_counter() - started)
@@ -809,7 +879,8 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
             if wants_audio:
                 payload["speaker"] = body.speaker or DEFAULT_SPEAKER
 
-            result = await call_engine(request, payload)
+            async with generation_slot():
+                result = await call_engine(request, payload)
             choices = result.get("choices")
             if not isinstance(choices, list) or not choices:
                 raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок не вернул choices.")
@@ -886,6 +957,10 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                 ],
                 "usage": usage,
             }
+        except ApiError as exc:
+            if exc.code == "QUEUE_FULL":
+                outcome = "busy"
+            raise
         finally:
             text_requests.labels(outcome=outcome).inc()
             text_duration.observe(time.perf_counter() - started)
@@ -902,7 +977,8 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                 "max_tokens": body.max_tokens,
                 "temperature": body.temperature,
             }
-            result = await call_engine(request, payload)
+            async with generation_slot():
+                result = await call_engine(request, payload)
             try:
                 text = result["choices"][0]["message"]["content"]
             except (KeyError, IndexError, TypeError) as error:
@@ -914,6 +990,10 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
             if isinstance(result.get("usage"), dict):
                 answer["usage"] = result["usage"]
             return answer
+        except ApiError as exc:
+            if exc.code == "QUEUE_FULL":
+                outcome = "busy"
+            raise
         finally:
             text_requests.labels(outcome=outcome).inc()
             text_duration.observe(time.perf_counter() - started)
@@ -967,7 +1047,8 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                 "max_tokens": 2048,
                 "messages": chat_messages,
             }
-            result = await call_engine(request, payload)
+            async with generation_slot():
+                result = await call_engine(request, payload)
             try:
                 raw_content = result["choices"][0]["message"]["content"]
             except (KeyError, IndexError, TypeError) as error:
@@ -993,6 +1074,10 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                 "transcript": transcript.strip(),
                 "analysis": analysis,
             }
+        except ApiError as exc:
+            if exc.code == "QUEUE_FULL":
+                outcome = "busy"
+            raise
         finally:
             await file.close()
             speech_requests.labels(outcome=outcome).inc()
@@ -1047,65 +1132,66 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                 "speaker": chosen_speaker,
                 "messages": chat_messages,
             }
-            result = await call_engine(request, payload)
-            try:
-                raw_text, raw_audio, _ = decode_reply(result)
-            except (ValueError, RuntimeError, wave.Error, EOFError, KeyError, TypeError) as error:
-                raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок не вернул корректные текст и WAV.") from error
-
-            clean_audio, wav_meta = ensure_pcm16_wav(raw_audio)
-            spoken_text, tool_payload = split_spoken_and_tool_call(raw_text)
-            if not spoken_text:
-                raise ApiError(502, "INVALID_MODEL_OUTPUT", "Публичная текстовая реплика пуста после отделения <tool_call>.")
-
-            if effective_format == "wav":
-                outcome = "success"
-                return Response(
-                    clean_audio,
-                    media_type="audio/wav",
-                    headers={"Content-Disposition": 'attachment; filename="answer.wav"'},
-                )
-
-            transcript: str | None = None
-            feedback_obj: dict[str, Any] | None = None
-            if include_feedback:
-                if not isinstance(tool_payload, dict):
-                    raise ApiError(
-                        502,
-                        "INVALID_MODEL_OUTPUT",
-                        "При include_feedback=true модель не вернула структурированный блок <tool_call>.",
-                    )
-                if isinstance(tool_payload.get("transcript"), str):
-                    transcript = tool_payload["transcript"].strip()
-                feedback_candidate = tool_payload.get("feedback", tool_payload)
-                if not isinstance(feedback_candidate, dict):
-                    raise ApiError(502, "INVALID_MODEL_OUTPUT", "Поле feedback должно быть JSON-объектом.")
-                feedback_obj = feedback_candidate
-
-            if transcript is None:
-                stt_payload = {
-                    "model": MODEL,
-                    "modalities": ["text"],
-                    "stream": False,
-                    "temperature": 0.0,
-                    "max_tokens": 512,
-                    "messages": [
-                        {"role": "system", "content": TRANSCRIBE_SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + encoded}},
-                                {"type": "text", "text": "Расшифруй эту аудиозапись дословно."},
-                            ],
-                        },
-                    ],
-                }
-                stt_result = await call_engine(request, stt_payload)
+            async with generation_slot():
+                result = await call_engine(request, payload)
                 try:
-                    stt_text = stt_result["choices"][0]["message"]["content"]
-                    transcript = stt_text.strip() if isinstance(stt_text, str) else ""
-                except (KeyError, IndexError, TypeError):
-                    transcript = ""
+                    raw_text, raw_audio, _ = decode_reply(result)
+                except (ValueError, RuntimeError, wave.Error, EOFError, KeyError, TypeError) as error:
+                    raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок не вернул корректные текст и WAV.") from error
+
+                clean_audio, wav_meta = ensure_pcm16_wav(raw_audio)
+                spoken_text, tool_payload = split_spoken_and_tool_call(raw_text)
+                if not spoken_text:
+                    raise ApiError(502, "INVALID_MODEL_OUTPUT", "Публичная текстовая реплика пуста после отделения <tool_call>.")
+
+                if effective_format == "wav":
+                    outcome = "success"
+                    return Response(
+                        clean_audio,
+                        media_type="audio/wav",
+                        headers={"Content-Disposition": 'attachment; filename="answer.wav"'},
+                    )
+
+                transcript: str | None = None
+                feedback_obj: dict[str, Any] | None = None
+                if include_feedback:
+                    if not isinstance(tool_payload, dict):
+                        raise ApiError(
+                            502,
+                            "INVALID_MODEL_OUTPUT",
+                            "При include_feedback=true модель не вернула структурированный блок <tool_call>.",
+                        )
+                    if isinstance(tool_payload.get("transcript"), str):
+                        transcript = tool_payload["transcript"].strip()
+                    feedback_candidate = tool_payload.get("feedback", tool_payload)
+                    if not isinstance(feedback_candidate, dict):
+                        raise ApiError(502, "INVALID_MODEL_OUTPUT", "Поле feedback должно быть JSON-объектом.")
+                    feedback_obj = feedback_candidate
+
+                if transcript is None:
+                    stt_payload = {
+                        "model": MODEL,
+                        "modalities": ["text"],
+                        "stream": False,
+                        "temperature": 0.0,
+                        "max_tokens": 512,
+                        "messages": [
+                            {"role": "system", "content": TRANSCRIBE_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + encoded}},
+                                    {"type": "text", "text": "Расшифруй эту аудиозапись дословно."},
+                                ],
+                            },
+                        ],
+                    }
+                    stt_result = await call_engine(request, stt_payload)
+                    try:
+                        stt_text = stt_result["choices"][0]["message"]["content"]
+                        transcript = stt_text.strip() if isinstance(stt_text, str) else ""
+                    except (KeyError, IndexError, TypeError):
+                        transcript = ""
 
             outcome = "success"
             return {
@@ -1119,6 +1205,10 @@ def create_app(*, transport=None, normalizer=normalize_audio_with_info, max_conc
                 },
                 "feedback": feedback_obj if include_feedback else None,
             }
+        except ApiError as exc:
+            if exc.code == "QUEUE_FULL":
+                outcome = "busy"
+            raise
         finally:
             await file.close()
             speech_requests.labels(outcome=outcome).inc()

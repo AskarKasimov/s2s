@@ -1,6 +1,7 @@
 """Container entrypoint: validate GPU, download a pinned model, serve offline."""
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -14,6 +15,7 @@ from gpu_policy import validate_gpu, validate_stage_budgets
 ROOT = Path(__file__).resolve().parent
 VERSIONS = json.loads((ROOT / "versions.json").read_text())
 PREPARED = Path("/models/prepared.json")
+HASH_CHUNK_BYTES = 16 * 1024**2
 
 
 def fix_host_permissions(*paths):
@@ -30,6 +32,14 @@ def fix_host_permissions(*paths):
                 os.chown(item, uid_int, gid_int, follow_symlinks=False)
             except OSError:
                 pass
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def gpu_check():
@@ -70,7 +80,7 @@ def gpu_check():
 
 
 def validate_checkpoint(path):
-    """Check quantization scope, stage presence and complete safetensors payloads."""
+    """Check quantization scope, stage presence, complete safetensors payloads, and SHA-256 digests."""
     path = Path(path)
     config = json.loads((path / "config.json").read_text())
     quant = config.get("quantization_config", {})
@@ -88,9 +98,14 @@ def validate_checkpoint(path):
         raise RuntimeError("Не найдены INT4-веса Thinker.")
     if any(k.startswith(("talker.", "code2wav.")) and k.endswith(".qweight") for k in weights):
         raise RuntimeError("Голосовые стадии неожиданно квантованы.")
+    expected_hashes = VERSIONS.get("model_shard_sha256", {})
+    shard_names = sorted(set(weights.values()))
+    if set(shard_names) != set(expected_hashes):
+        raise RuntimeError("Список файлов safetensors не совпадает с закреплённым манифестом versions.json.")
     total_bytes = 0
     seen = set()
-    for name in sorted(set(weights.values())):
+    verified_hashes = {}
+    for name in shard_names:
         shard = path / name
         if Path(name).name != name:
             raise RuntimeError("Недопустимое имя shard в индексе.")
@@ -109,11 +124,20 @@ def validate_checkpoint(path):
         end = max(tensor["data_offsets"][1] for tensor in tensors.values())
         if shard.stat().st_size != 8 + header_size + end:
             raise RuntimeError(f"Файл {name} скачан не полностью.")
+        actual_sha256 = sha256_file(shard)
+        if actual_sha256 != expected_hashes[name]:
+            raise RuntimeError(f"Контрольная сумма SHA-256 файла {name} не совпадает (данные тензоров повреждены).")
+        verified_hashes[name] = actual_sha256
         total_bytes += sum(t["data_offsets"][1] - t["data_offsets"][0] for t in tensors.values())
         seen.update(tensors)
     if total_bytes != VERSIONS["model_tensor_bytes"] or seen != set(weights):
         raise RuntimeError("Размер или состав весов не совпадает с закреплённой моделью.")
-    return {"path": str(path), "tensor_bytes": total_bytes, "shards": len(set(weights.values()))}
+    return {
+        "path": str(path),
+        "tensor_bytes": total_bytes,
+        "shards": len(shard_names),
+        "shard_sha256": verified_hashes,
+    }
 
 
 def prepare():

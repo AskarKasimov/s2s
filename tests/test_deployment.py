@@ -2,6 +2,7 @@
 
 import base64
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -58,11 +59,13 @@ class CheckpointTests(unittest.TestCase):
                   for i, name in enumerate(names)}
         data = json.dumps(header).encode()
         self.shard = self.path / "model.safetensors"
-        self.shard.write_bytes(struct.pack("<Q", len(data)) + data + bytes(12))
+        shard_bytes = struct.pack("<Q", len(data)) + data + bytes(12)
+        self.shard.write_bytes(shard_bytes)
         self.index = {"weight_map": {name: self.shard.name for name in names}}
         (self.path / "model.safetensors.index.json").write_text(json.dumps(self.index))
         versions = copy.deepcopy(runtime.VERSIONS)
         versions["model_tensor_bytes"] = 12
+        versions["model_shard_sha256"] = {self.shard.name: hashlib.sha256(shard_bytes).hexdigest()}
         self.context = patch.object(runtime, "VERSIONS", versions)
         self.context.start()
         self.addCleanup(self.context.stop)
@@ -73,6 +76,13 @@ class CheckpointTests(unittest.TestCase):
     def test_truncated_download_rejected(self):
         self.shard.write_bytes(self.shard.read_bytes()[:-1])
         with self.assertRaisesRegex(RuntimeError, "не полностью"):
+            runtime.validate_checkpoint(self.path)
+
+    def test_corrupted_payload_same_size_rejected(self):
+        raw = bytearray(self.shard.read_bytes())
+        raw[-1] ^= 0xFF
+        self.shard.write_bytes(bytes(raw))
+        with self.assertRaisesRegex(RuntimeError, "SHA-256"):
             runtime.validate_checkpoint(self.path)
 
     def test_missing_voice_stage_rejected(self):

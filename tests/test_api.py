@@ -299,15 +299,19 @@ class ApiTests(unittest.TestCase):
             entered, release = asyncio.Event(), asyncio.Event()
             in_flight = 0
 
-            async def normalizer(data):
-                nonlocal in_flight
-                in_flight += 1
-                if in_flight == 4:
-                    entered.set()
-                await release.wait()
+            class BlockingTransport(httpx.AsyncBaseTransport):
+                async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                    nonlocal in_flight
+                    in_flight += 1
+                    if in_flight == 4:
+                        entered.set()
+                    await release.wait()
+                    return httpx.Response(200, json=reply())
+
+            async def fast_normalizer(data):
                 return data, {"seconds": 0.1, "sample_rate": 24000, "rms": 100.0}
 
-            app = create_app(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply())), normalizer=normalizer)
+            app = create_app(transport=BlockingTransport(), normalizer=fast_normalizer)
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
                     tasks = [
@@ -323,6 +327,78 @@ class ApiTests(unittest.TestCase):
                     release.set()
                     for task in tasks:
                         self.assertEqual((await task).status_code, 200)
+
+        asyncio.run(check())
+
+    def test_slow_uploads_do_not_block_generation_and_time_out(self):
+        async def check():
+            app = create_app(
+                transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply())),
+                max_concurrent=4,
+                max_inflight=16,
+                body_read_timeout=0.25,
+            )
+            stalled_started = 0
+            all_stalled = asyncio.Event()
+
+            async def run_stalled_upload():
+                nonlocal stalled_started
+                sent_first = False
+                responses = []
+
+                async def slow_receive():
+                    nonlocal sent_first, stalled_started
+                    if not sent_first:
+                        sent_first = True
+                        stalled_started += 1
+                        if stalled_started == 4:
+                            all_stalled.set()
+                        return {"type": "http.request", "body": b'{"messages":', "more_body": True}
+                    await asyncio.sleep(10)
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                async def capture_send(message):
+                    responses.append(message)
+
+                scope = {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "http",
+                    "path": "/chat",
+                    "raw_path": b"/chat",
+                    "query_string": b"",
+                    "headers": [(b"content-type", b"application/json")],
+                    "client": ("127.0.0.1", 12345),
+                    "server": ("test", 80),
+                }
+                await app(scope, slow_receive, capture_send)
+                start_msg = next(m for m in responses if m["type"] == "http.response.start")
+                body_msg = next(m for m in responses if m["type"] == "http.response.body")
+                return start_msg["status"], json.loads(body_msg["body"].decode("utf-8"))
+
+            async with app.router.lifespan_context(app):
+                slow_tasks = [asyncio.create_task(run_stalled_upload()) for _ in range(4)]
+                await asyncio.wait_for(all_stalled.wait(), 2)
+
+                # While 4 slow uploads are stalled in receive(), normal requests still succeed
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+                    chat_ok = await client.post("/chat", json={"messages": [{"role": "user", "content": "2+2?"}]})
+                    self.assertEqual(chat_ok.status_code, 200)
+                    s2s_ok = await client.post(
+                        "/speech-to-speech",
+                        files={"file": ("q.wav", audio(), "audio/wav")},
+                        data={"response_format": "wav"},
+                    )
+                    self.assertEqual(s2s_ok.status_code, 200)
+
+                # Stalled uploads time out with 408 INVALID_REQUEST
+                for task in slow_tasks:
+                    status, payload = await asyncio.wait_for(task, 2)
+                    self.assertEqual(status, 408)
+                    self.assertEqual(payload["error"]["code"], "INVALID_REQUEST")
+                    self.assertTrue(payload["error"]["retryable"])
 
         asyncio.run(check())
 
