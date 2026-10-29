@@ -30,6 +30,21 @@ cp -n .env.example .env
 
 #### Возможные ошибки на Шаге 2 и их решение
 
+- **Не установлен Docker (`Не найдена команда docker`):**
+  Установите Docker и добавьте текущего пользователя в группу `docker`:
+  ```bash
+  curl -fsSL https://get.docker.com | sudo sh
+  sudo usermod -aG docker "$USER"
+  newgrp docker
+  ```
+
+- **Нет прав доступа к Docker (`Нет доступа для проверки диска Docker` или `permission denied while trying to connect to the Docker daemon`):**
+  Добавьте пользователя в группу `docker` или запустите команду через `sudo`:
+  ```bash
+  sudo usermod -aG docker "$USER"
+  newgrp docker
+  ```
+
 - **Старый драйвер (`Драйвер ... слишком старый. Для выбранного CUDA 13 стека нужен 580.95.05 или новее`):**
   Обновите драйвер NVIDIA и перезагрузите сервер:
   ```bash
