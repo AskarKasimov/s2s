@@ -287,6 +287,7 @@ class ApiTests(unittest.TestCase):
 
     def test_speech_to_speech_json_default_and_feedback_and_wav(self):
         seen_stt_max_tokens = []
+        seen_main_max_tokens = []
         tool_call_transcript = "Ответ студента из тулколла"
 
         def engine(request):
@@ -294,6 +295,7 @@ class ApiTests(unittest.TestCase):
             if payload["modalities"] == ["text"]:
                 seen_stt_max_tokens.append(payload.get("max_tokens"))
                 return httpx.Response(200, json={"choices": [{"message": {"content": "Ответ студента вслух"}}]})
+            seen_main_max_tokens.append(payload.get("max_tokens"))
             sys_prompt = payload["messages"][0]["content"]
             if "<tool_call>" in sys_prompt:
                 text = (
@@ -311,6 +313,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r1.status_code, 200)
         b1 = r1.json()
         self.assertEqual(b1["transcript"], "Ответ студента вслух")
+        self.assertEqual(seen_main_max_tokens[0], 512)
         self.assertEqual(seen_stt_max_tokens[-1], 1024)
         self.assertEqual(b1["text"], "Публичная реплика наставника.")
         self.assertIsNone(b1["feedback"])
@@ -325,6 +328,7 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(r2.status_code, 200)
         b2 = r2.json()
+        self.assertEqual(seen_main_max_tokens[1], 2048)
         self.assertEqual(b2["text"], "Публичная реплика наставника.")
         self.assertNotIn("<tool_call>", b2["text"])
         self.assertEqual(b2["transcript"], "Ответ студента из тулколла")

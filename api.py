@@ -1220,6 +1220,7 @@ def create_app(
                 "model": MODEL,
                 "modalities": ["text", "audio"],
                 "stream": False,
+                "max_tokens": 2048 if include_feedback else 512,
                 "speaker": chosen_speaker,
                 "messages": chat_messages,
             }
