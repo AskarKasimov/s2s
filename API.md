@@ -1,142 +1,286 @@
-# HTTP API speech-to-speech
+# Контракт HTTP API сервиса Qwen3-Omni
 
-После `./run.sh install` API работает на `http://SERVER:8002`.
-Порт и интерфейс меняются через `S2S_API_PORT` и `S2S_API_BIND` в `.env`.
-По умолчанию порт опубликован на всех интерфейсах (`0.0.0.0`).
-Для доступа только с самого сервера задайте `S2S_API_BIND=127.0.0.1`.
+Это API сервера модели (`http://<IP_СЕРВЕРА>:8002`). Backend продолжает работать через ваш gateway для LLM-задач. Поля `complexity`, `urgent` и `routing_profile` остаются ответственностью gateway; серверу Qwen они не нужны.
 
-Интерактивная документация: `http://SERVER:8002/docs`.
-Для проверки в браузере раскройте `POST /speech-to-speech`, нажмите
-**Try it out**, выберите аудиофайл в поле `file` и нажмите **Execute**.
+Интерактивный Swagger UI: **`http://<IP_СЕРВЕРА>:8002/docs`**.
 
-## Проверка готовности
+---
 
+## 1. Общие правила
+
+- Все ручки используют один checkpoint `Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound` (`Qwen/Qwen3-Omni-30B-A3B-Instruct`).
+- История передаётся в запросе; сервер модели не хранит учебные сессии.
+- Имена голосов во внешнем API: **`ethan`** (по умолчанию), **`chelsie`**, **`aiden`**. Внутри сервер преобразует их в формат движка.
+- STT (`/transcribe`) и анализ аудио (`/analyze-audio`) возвращают только текстовые результаты (`modalities: ["text"]`), без запуска стадий генерации речи.
+- На первом этапе поддерживается только `stream: false`.
+- `temperature: 0.0` относится к текстовой генерации `Thinker`. Параметры `Talker` и `Code2Wav` сервер настраивает отдельно в `deploy.yaml`.
+- Каждый ответ содержит заголовок **`X-Request-ID`** (если клиент прислал свой `X-Request-ID`, сервер пробрасывает его обратно).
+- Аудио на выходе — настоящий WAV с **PCM 16-bit моно**. Частоту (`sample_rate`) и число каналов (`channels: 1`) сервер возвращает в метаданных JSON; при бинарном ответе они доступны в заголовке WAV.
+- Входное аудио: поддерживаются **WAV, Ogg/Opus, WebM/Opus, MP3, FLAC**, размер до **25 МиБ** и длительность до **90 секунд**. Сервер декодирует и приводит их к формату модели (16 кГц, PCM 16-bit, моно).
+- При отключении клиента сервер отменяет связанный запрос к движку и освобождает слот.
+
+---
+
+## 2. Распознавание речи: `POST /transcribe`
+
+`Content-Type: multipart/form-data`
+
+| Поле | Тип | Обязательное | Значение |
+| :--- | :--- | :--- | :--- |
+| `file` | файл | Да | Аудио студента |
+| `language` | строка | Нет | `ru` или `auto`, по умолчанию `ru` |
+
+### Пример запроса
 ```bash
-curl --fail http://localhost:8002/health
+curl -X POST http://localhost:8002/transcribe \
+  -F 'file=@student.ogg' \
+  -F 'language=ru'
 ```
 
-Ответ при готовом движке:
-
-```json
-{"status":"ok","model":"qwen3-omni-speech","quantization":"int4-AutoRound"}
-```
-
-Если движок не отвечает, возвращается HTTP 503. `/health` проверяет доступность
-движка; реальный голосовой тракт проверяется командой `./run.sh verify`.
-
-## Голосовой вопрос → WAV ответа
-
-```bash
-curl --fail-with-body -X POST http://localhost:8002/speech-to-speech \
-  -F 'file=@question.wav' --output answer.wav
-```
-
-Поле `file` обязательно. Поддерживаются WAV, MP3, OGG, WebM и FLAC:
-API сам преобразует запись в WAV PCM 16 бит, моно, 16 кГц.
-Ограничения: до **10 MiB**, до **30 секунд**, до **4 запросов одновременно**.
-Ответ — `audio/wav`, готовый файл без base64. Вопрос должен содержаться в
-записи; модель отвечает на него по-русски кратко, а не возвращает транскрипцию.
-
-## Текст и аудио в одном JSON
-
-```bash
-curl --fail-with-body -X POST \
-  'http://localhost:8002/speech-to-speech?response_format=json' \
-  -F 'file=@question.webm' --output answer.json
-```
-
-Формат ответа:
-
+### Ответ `200 application/json`
 ```json
 {
-  "text": "Четыре.",
-  "model": "qwen3-omni-speech",
-  "audio": {"format": "wav", "sample_rate": 24000, "data": "BASE64_WAV"}
+  "text": "Предельные издержки — это изменение общих издержек...",
+  "language": "ru",
+  "duration_seconds": 18.4
 }
 ```
 
-`sample_rate` — фактическая частота возвращённого WAV. Для сохранения аудио:
+### Поведение
+- Только дословное распознавание речи, без ответа на содержащиеся в записи вопросы.
+- Без исправления предметных ошибок и без дополнения ответа студента.
+- Если в записи тишина / нет речи — возвращается `422 NO_SPEECH_DETECTED`.
+- Инструкцию на транскрибирование сервер задаёт сам.
 
-```bash
-python3 - <<'PY'
-import base64, json
-from pathlib import Path
-result = json.loads(Path('answer.json').read_text())
-print(result['text'])
-Path('answer.wav').write_bytes(base64.b64decode(result['audio']['data']))
-PY
-```
+---
 
-Каждый голосовой запрос независим. История голосового разговора и непрерывная
-передача микрофонного звука не предусмотрены. Таймаут модели для обеих ручек — 900 секунд,
-включая прогрев первого запроса; это не целевая задержка ответа.
+## 3. Озвучка: `POST /synthesize`
 
-## Текстовый LLM: `POST /chat`
+`Content-Type: application/json`
 
-Для текстового запроса без синтеза речи:
+> **Статус:** экспериментальная ручка (так как в архитектуре `Qwen3-Omni` стадия `Talker` получает скрытые состояния от `Thinker`, дословное чтение обеспечивается серверным дикторским шаблоном `<read>...</read>` при `temperature: 0.0`).
 
-```bash
-curl --fail-with-body http://localhost:8002/chat \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "messages": [
-      {"role": "system", "content": "Отвечай по-русски."},
-      {"role": "user", "content": "Объясни, что такое фотосинтез."}
-    ],
-    "max_tokens": 256,
-    "temperature": 0.7
-  }'
-```
-
-Ответ:
-
+### Запрос
 ```json
-{"text":"Фотосинтез — это процесс...","model":"qwen3-omni-speech"}
+{
+  "text": "Объясните, чем постоянные издержки отличаются от переменных.",
+  "speaker": "ethan",
+  "response_format": "wav"
+}
 ```
 
-Если движок вернул статистику токенов, в ответе также присутствует `usage`.
-Для диалога передавайте предыдущие сообщения вместе с новым вопросом в
-`messages`. История на сервере не сохраняется. Допустимые роли:
-`system`, `user`, `assistant`; `content` — непустая строка.
+| Поле | Обязательное | Значение |
+| :--- | :--- | :--- |
+| `text` | Да | Точный текст для чтения (до **500 символов**) |
+| `speaker` | Нет | `ethan`, `chelsie` или `aiden` (по умолчанию `ethan`) |
+| `response_format` | Нет | `wav` или `json` (по умолчанию `wav`) |
 
-Лимиты: от 1 до 32 сообщений, до 8000 символов на сообщение и 12 000 суммарно;
-тело запроса до 128 KiB. `max_tokens`: 1–1024, по умолчанию 256;
-`temperature`: 0–2, по умолчанию 0.7. Контекст модели — 4096 токенов вместе
-с ответом; лимит символов не гарантирует попадания в контекст. Если движок
-отклонил слишком длинный запрос, API вернёт 422. Потоковая выдача не включена.
+### Ответ для `wav`
+`HTTP/1.1 200 OK`  
+`Content-Type: audio/wav`  
+`<байты WAV PCM 16-bit>`
 
-Используется Thinker той же Qwen3-Omni с `modalities: ["text"]`;
-голосовые стадии для текстового ответа не выполняются. В общем сервисе их
-веса остаются загруженными для speech-to-speech. Промпт для краткого голосового
-ответа к `/chat` не добавляется — поведение задаётся вашими `messages`.
+### Ответ для `json`
+```json
+{
+  "text": "Объясните, чем постоянные издержки отличаются от переменных.",
+  "audio": {
+    "data": "<base64 полного WAV-файла>",
+    "format": "wav",
+    "sample_rate": 24000,
+    "channels": 1
+  }
+}
+```
 
-Общий лимит для `/chat` и `/speech-to-speech` — до **4 параллельных генераций одновременно**.
-При заполнении всех 4 слотов новые запросы получают HTTP 429.
+---
 
-## Ошибки
+## 4. Текстовые и мультимодальные задачи: `POST /v1/chat/completions`
 
-| HTTP | Причина |
-| --- | --- |
-| 400 | Пустое, повреждённое или нераспознаваемое аудио; тишина |
-| 413 | Превышен лимит файла/длительности или тела запроса (для `/chat` — 128 KiB) |
-| 422 | Неверные параметры, слишком длинная история, отсутствующий `file` или таймаут ffmpeg |
-| 429 | Уже обрабатывается другой запрос; `Retry-After: 5` |
-| 502 | Ошибка движка или некорректный ответ: для `/chat` нужен текст, для speech-to-speech — текст и звук |
-| 503 | Нет соединения с движком модели |
-| 504 | Истёк таймаут ответа модели |
+OpenAI-совместимая ручка (`POST /chat` сохранён как упрощённый алиас).
 
-Ошибки возвращаются как `{"detail":"описание"}`. При ошибке `curl` файл
-`answer.wav` может содержать JSON; `--fail-with-body` выставляет ненулевой код
-завершения, поэтому проверяйте результат команды перед воспроизведением.
+### Запрос
+```json
+{
+  "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Ты преподаватель. Используй только переданные материалы."
+    },
+    {
+      "role": "user",
+      "content": "Материалы курса и задача..."
+    }
+  ],
+  "modalities": ["text"],
+  "temperature": 0.0,
+  "max_tokens": 2048,
+  "response_format": {
+    "type": "json_object"
+  },
+  "stream": false
+}
+```
 
-## Мониторинг и прямой доступ к Omni
+| Поле | Требование |
+| :--- | :--- |
+| `messages` | Роли `system`, `user`, `assistant`; сохранение порядка истории |
+| `modalities` | `["text"]` (по умолчанию) или `["text", "audio"]` |
+| `temperature` | `0.0`–`2.0` (по умолчанию `0.0`) |
+| `max_tokens` | Ограничение текстового ответа (`1`–`4096`, по умолчанию `2048`) |
+| `response_format` | `{"type": "text"}` / `"text"` или `{"type": "json_object"}` / `"json_object"` |
+| `stream` | На первом этапе только `false` (при `true` возвращается `400 UNSUPPORTED_PARAMETER`) |
+| `speaker` | `ethan`, `chelsie`, `aiden` — используется при `modalities: ["text", "audio"]` |
+| `reasoning_effort` | **Не поддерживается** данным checkpoint'ом (возвращает `400 UNSUPPORTED_PARAMETER`, см. `GET /capabilities`) |
 
-`GET /metrics` возвращает Prometheus-счётчики запросов, ошибок и занятости,
-а также гистограммы длительности обработки: `speech_requests_total`,
-`speech_request_duration_seconds`, `text_requests_total`, `text_request_duration_seconds`.
-Для подключения к внешнему Prometheus добавьте target `<SERVER_IP>:8002` (или `api:8000` внутри Docker-сети `qwen3-speech_default`).
+### Текстовый ответ (`modalities: ["text"]`)
+```json
+{
+  "id": "chatcmpl-123",
+  "object": "chat.completion",
+  "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"verdict\":\"partial\",\"feedback\":\"...\"}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1200,
+    "completion_tokens": 180,
+    "total_tokens": 1380
+  }
+}
+```
+В режиме `json_object` поле `content` гарантированно содержит валидную JSON-строку без Markdown-обёртки ````json`. При достижении лимита токенов возвращается `finish_reason: "length"`.
 
-Для расширенной интеграции сохранён исходный OpenAI-compatible API Omni:
-`http://127.0.0.1:8091/v1/chat/completions`, модель `qwen3-omni-speech`.
-Пример есть в `client.py`. Этот порт доступен только локально. Прямой доступ
-обходит ограничения HTTP-обёртки; для обычного приложения используйте порт 8002.
+### Ответ с озвучкой (`modalities: ["text", "audio"]`)
+Сервер нормализует ответ движка в единый `choices[0].message`:
+```json
+{
+  "role": "assistant",
+  "content": "Публичный ответ преподавателя.",
+  "audio": {
+    "data": "<base64 WAV>",
+    "format": "wav",
+    "sample_rate": 24000,
+    "channels": 1
+  }
+}
+```
+
+---
+
+## 5. Анализ ответа студента: `POST /analyze-audio`
+
+`Content-Type: multipart/form-data`
+
+| Поле | Тип | Обязательное | Описание |
+| :--- | :--- | :--- | :--- |
+| `file` | файл | Да | Аудиозапись ответа студента |
+| `prompt` | строка | Да | Вопрос, эталон, материалы и критерии оценки |
+| `system_prompt` | строка | Нет | Дополнительная системная роль |
+| `messages` | JSON-строка | Нет | Предыдущая история диалога (JSON-массив сообщений) |
+| `response_format` | строка | Нет | `json_object` (по умолчанию) или `text` |
+
+### Пример запроса
+```bash
+curl -X POST http://localhost:8002/analyze-audio \
+  -F 'file=@student_answer.webm' \
+  -F 'prompt=Оцени ответ студента по критериям k1, k2 и верни вердикт.' \
+  -F 'response_format=json_object'
+```
+
+### Ответ
+```json
+{
+  "transcript": "Точный текст ответа студента...",
+  "analysis": {
+    "verdict": "partial",
+    "answer_complete": false,
+    "criteria": {
+      "k1": 2,
+      "k2": 1,
+      "k3": null,
+      "k4": null
+    },
+    "rationale": "Определение верное, но обоснование неполное.",
+    "feedback": "Определение верное. Объясните, почему..."
+  }
+}
+```
+- `transcript` — дословно распознанный ответ студента.
+- `analysis` — JSON-объект при `response_format=json_object` (структура определяется вашим `prompt`) или строка при `response_format=text`.
+- Аудио не генерируется.
+
+---
+
+## 6. Голосовой диалог: `POST /speech-to-speech`
+
+`Content-Type: multipart/form-data`
+
+| Поле | Тип | Обязательное | Описание |
+| :--- | :--- | :--- | :--- |
+| `file` | файл | Да | Аудиозапись студента |
+| `system_prompt` | строка | Нет | Инструкция для наставника |
+| `prompt` | строка | Нет | Контекст текущего хода |
+| `messages` | JSON-строка | Нет | История сообщений (JSON-массив) |
+| `speaker` | строка | Нет | `ethan` (по умолчанию), `chelsie`, `aiden` |
+| `response_format` | строка | Нет | `json` (по умолчанию) или `wav` |
+| `include_feedback` | boolean | Нет | `false` (по умолчанию) или `true` |
+
+### Ответ при `response_format=json` (по умолчанию)
+```json
+{
+  "transcript": "Ответ студента...",
+  "text": "Публичная реплика наставника.",
+  "audio": {
+    "data": "<base64 WAV>",
+    "format": "wav",
+    "sample_rate": 24000,
+    "channels": 1
+  },
+  "feedback": null
+}
+```
+- При `include_feedback: true` сервер использует токен-границу `<tool_call>` (на которой `Talker` в `vLLM-Omni` прекращает озвучку), проверяет и отделяет JSON-блок от публичной реплики `text`, возвращая структурированный объект в поле `feedback`. В аудио попадает только публичная реплика `text`.
+- При `response_format=wav` возвращается бинарный `audio/wav`.
+
+---
+
+## 7. Ошибки, готовность и возможности
+
+### Единый формат ошибок
+Все ошибки возвращаются с заголовком `X-Request-ID` и единым JSON-телом:
+```json
+{
+  "error": {
+    "code": "INVALID_AUDIO",
+    "message": "Не удалось декодировать аудио.",
+    "retryable": false
+  },
+  "request_id": "req-123"
+}
+```
+
+| HTTP | Код (`error.code`) | Когда возникает |
+| :--- | :--- | :--- |
+| `400` | `INVALID_REQUEST` / `UNSUPPORTED_PARAMETER` | Некорректная схема запроса, неподдерживаемый голос, `stream=true` или `reasoning_effort` |
+| `413` | `AUDIO_TOO_LARGE` | Файл больше 25 МиБ или длиннее 90 секунд |
+| `415` | `UNSUPPORTED_AUDIO_FORMAT` | Неподдерживаемый MIME-тип или расширение файла |
+| `422` | `INVALID_AUDIO` / `NO_SPEECH_DETECTED` | Битый аудиофайл или запись содержит только тишину |
+| `429` | `QUEUE_FULL` | Все 4 слота генерации заняты (содержит заголовок `Retry-After: 5`, `retryable: true`) |
+| `502` | `INVALID_MODEL_OUTPUT` | Движок вернул невалидный JSON или повреждённый WAV |
+| `503` | `MODEL_NOT_READY` | Движок ещё загружается или недоступен (`retryable: true`) |
+| `504` | `INFERENCE_TIMEOUT` | Превышен таймаут ожидания ответа от модели (`retryable: true`) |
+
+### Служебные ручки
+- **`GET /health/live`** — процесс HTTP-шлюза жив (`200 OK`).
+- **`GET /health/ready`** (и алиас **`GET /health`**) — все стадии модели в `omni` загружены и готовы к работе (`200 OK` или `503 MODEL_NOT_READY`).
+- **`GET /capabilities`** — возвращает метаданные checkpoint'а, список голосов (`ethan`, `chelsie`, `aiden`), поддерживаемые аудиоформаты, лимиты (25 МиБ, 90 с, 500 символов для `/synthesize`, 4 параллельных слота), список ручек и флаги фич (`streaming: false`, `reasoning_effort: false`, `speech_to_speech_feedback: true`, `synthesize_experimental: true`).
+- **`GET /metrics`** — метрики Prometheus.

@@ -1,13 +1,15 @@
-# s2s — Qwen3-Omni (Speech-to-Speech)
+# s2s — Qwen3-Omni (Speech-to-Speech, STT, TTS, Audio Analysis & Chat API)
 
-Голосовой и текстовый сервис на базе `Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound` для одной видеокарты **NVIDIA 80 ГБ (A100 / H100)**.
+Голосовой и текстовый сервер на базе `Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound` для одной видеокарты **NVIDIA 80 ГБ (A100 / H100)**.
 Держит до **4 параллельных запросов** одновременно.
 
-После запуска работает HTTP API на порту **`8002`**:
-- `POST /speech-to-speech` — отправить аудио, получить голосовой ответ
-- `POST /chat` — обычный текстовый чат с моделью (без озвучки)
-- `GET /health` — проверка что сервис жив
-- `GET /docs` — Swagger (можно потыкать запросы прямо в браузере)
+После запуска на порту **`8002`** доступны все ручки единого контракта (подробное описание полей — в **[API.md](API.md)**):
+- `POST /transcribe` — распознавание речи (STT): аудио студента $\rightarrow$ точный текст без исправлений (`ru` / `auto`)
+- `POST /synthesize` — озвучка текста (TTS, до 500 символов, голоса `ethan`, `chelsie`, `aiden`) $\rightarrow$ `wav` или `json`
+- `POST /v1/chat/completions` (и алиас `POST /chat`) — OpenAI-совместимая ручка (`text` / `json_object`, `modalities: ["text"]` или `["text", "audio"]`)
+- `POST /analyze-audio` — анализ голосового ответа студента по вашему `prompt` и критериям $\rightarrow$ `transcript` + `analysis`
+- `POST /speech-to-speech` — живой голосовой диалог с наставником (`json` с `transcript`, `text`, `audio`, `feedback` или чистый `wav`)
+- `GET /health/live`, `GET /health/ready`, `GET /capabilities`, `GET /metrics`, `GET /docs` (Swagger в браузере)
 
 ---
 
@@ -95,7 +97,7 @@ cp -n .env.example .env
 ```bash
 ./run.sh install
 ```
-Она сама соберёт Docker-образ, проверит видеокарту, скачает 26.3 ГБ весов модели в `./data`, поднимет контейнеры и прогонит тестовый голосовой запрос.
+Она сама соберёт Docker-образ, проверит видеокарту, скачает 26.3 ГБ весов модели в `./data`, поднимет контейнеры и прогонит тестовые запросы.
 
 Первый запуск занимает **15–30 минут**. Чтобы ничего не оборвалось, если отвалится SSH, лучше запускать так:
 ```bash
@@ -110,41 +112,75 @@ tail -f install.log
 
 ---
 
-## Шаг 4. Как отправлять запросы
+## Шаг 4. Примеры запросов ко всем ручкам
 
-В браузере можно открыть Swagger: `http://<IP_СЕРВЕРА>:8002/docs`
+В браузере можно открыть Swagger: `http://<IP_СЕРВЕРА>:8002/docs`  
+Подробные схемы запросов и ответов — в **[API.md](API.md)**.
 
-Примеры через `curl`:
-
-### 1. Проверить статус
+### 1. Проверить готовность и возможности
 ```bash
-curl http://localhost:8002/health
+curl http://localhost:8002/health/live
+curl http://localhost:8002/health/ready
+curl http://localhost:8002/capabilities
 ```
 
-### 2. Голосовой запрос -> получить WAV файл с ответом
-Принимает WAV, MP3, OGG, WebM, FLAC (до 30 сек и 10 МБ):
+### 2. Распознавание речи (`POST /transcribe`)
+Принимает WAV, Ogg/Opus, WebM/Opus, MP3, FLAC (до 25 МиБ и 90 секунд):
 ```bash
-curl -X POST http://localhost:8002/speech-to-speech \
+curl -X POST http://localhost:8002/transcribe \
   -F 'file=@output/test-question.wav' \
-  --output reply.wav
+  -F 'language=ru'
 ```
 
-### 3. Голосовой запрос -> получить JSON (текст ответа + аудио в base64)
+### 3. Озвучка текста (`POST /synthesize`)
+Голоса: `ethan` (по умолчанию), `chelsie`, `aiden`. До 500 символов:
 ```bash
-curl -X POST 'http://localhost:8002/speech-to-speech?response_format=json' \
-  -F 'file=@output/test-question.wav'
+curl -X POST http://localhost:8002/synthesize \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Объясните, чем постоянные издержки отличаются от переменных.", "speaker": "ethan", "response_format": "wav"}' \
+  --output synthesized.wav
 ```
 
-### 4. Обычный текстовый чат (без генерации звука)
+### 4. Текстовые задачи (`POST /v1/chat/completions`)
 ```bash
-curl -X POST http://localhost:8002/chat \
+curl -X POST http://localhost:8002/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
+    "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     "messages": [
-      {"role": "system", "content": "Отвечай кратко по-русски."},
-      {"role": "user", "content": "Привет! Сколько будет дважды два?"}
-    ]
+      {"role": "system", "content": "Ты преподаватель."},
+      {"role": "user", "content": "Верни JSON с полем verdict."}
+    ],
+    "modalities": ["text"],
+    "temperature": 0.0,
+    "max_tokens": 512,
+    "response_format": {"type": "json_object"},
+    "stream": false
   }'
+```
+
+### 5. Анализ аудиоответа студента (`POST /analyze-audio`)
+```bash
+curl -X POST http://localhost:8002/analyze-audio \
+  -F 'file=@output/test-question.wav' \
+  -F 'prompt=Оцени ответ студента и верни поля verdict и feedback.' \
+  -F 'response_format=json_object'
+```
+
+### 6. Голосовой диалог (`POST /speech-to-speech`)
+По умолчанию возвращает JSON (`transcript`, `text`, `audio` в base64, `feedback`):
+```bash
+# JSON-ответ с расшифровкой, репликой, аудио и feedback:
+curl -X POST http://localhost:8002/speech-to-speech \
+  -F 'file=@output/test-question.wav' \
+  -F 'speaker=ethan' \
+  -F 'include_feedback=true'
+
+# Чистый WAV-файл:
+curl -X POST http://localhost:8002/speech-to-speech \
+  -F 'file=@output/test-question.wav' \
+  -F 'response_format=wav' \
+  --output reply.wav
 ```
 
 ---
@@ -181,7 +217,7 @@ Docker не видит видеокарту. Выполни пункт **1.2** �
 **6. `Порт 8002 (или 8091) занят`**
 Либо сервис уже запущен (проверь через `./run.sh status`), либо порт занят чем-то другим на сервере. Во втором случае поменяй `S2S_API_PORT` в файле `.env`.
 
-**7. API отвечает `HTTP 429: Модель занята`**
+**7. API отвечает `HTTP 429 (QUEUE_FULL)`**
 Сейчас одновременно уже идут 4 запроса. Подожди пару секунд и отправь запрос снова.
 
 **8. Контейнер `omni` упал или долго висит в `unhealthy`**
