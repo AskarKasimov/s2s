@@ -142,6 +142,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["object"], "chat.completion")
+        self.assertIsInstance(body["created"], int)
         self.assertEqual(body["model"], "Qwen/Qwen3-Omni-30B-A3B-Instruct")
         self.assertEqual(json.loads(body["choices"][0]["message"]["content"]), {"verdict": "partial", "feedback": "ok"})
         self.assertEqual(body["choices"][0]["finish_reason"], "stop")
@@ -158,6 +159,23 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(msg["content"], "Публичный ответ преподавателя.")
         self.assertEqual(msg["audio"]["sample_rate"], 24000)
         self.assertEqual(msg["audio"]["channels"], 1)
+
+        # Multimodal input (list of content parts with audio_url) and assistant message with audio in history
+        mm_resp = client.post("/v1/chat/completions", json={
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "messages": [
+                msg,
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + base64.b64encode(audio()).decode()}},
+                        {"type": "text", "text": "Продолжим диалог"},
+                    ],
+                },
+            ],
+            "modalities": ["text"],
+        })
+        self.assertEqual(mm_resp.status_code, 200)
 
         # reasoning_effort explicitly rejected with UNSUPPORTED_PARAMETER
         re_resp = client.post("/v1/chat/completions", json={
@@ -266,15 +284,19 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(data["analysis"]["verdict"], "partial")
 
     def test_speech_to_speech_json_default_and_feedback_and_wav(self):
+        seen_stt_max_tokens = []
+        tool_call_transcript = "Ответ студента из тулколла"
+
         def engine(request):
             payload = json.loads(request.content)
             if payload["modalities"] == ["text"]:
+                seen_stt_max_tokens.append(payload.get("max_tokens"))
                 return httpx.Response(200, json={"choices": [{"message": {"content": "Ответ студента вслух"}}]})
             sys_prompt = payload["messages"][0]["content"]
             if "<tool_call>" in sys_prompt:
                 text = (
                     "Публичная реплика наставника.\n"
-                    '<tool_call>{"transcript": "Ответ студента из тулколла", "feedback": {"verdict": "partial", "score": 3}}</tool_call>'
+                    f'<tool_call>{{"transcript": "{tool_call_transcript}", "feedback": {{"verdict": "partial", "score": 3}}}}</tool_call>'
                 )
             else:
                 text = "Публичная реплика наставника."
@@ -287,6 +309,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r1.status_code, 200)
         b1 = r1.json()
         self.assertEqual(b1["transcript"], "Ответ студента вслух")
+        self.assertEqual(seen_stt_max_tokens[-1], 1024)
         self.assertEqual(b1["text"], "Публичная реплика наставника.")
         self.assertIsNone(b1["feedback"])
         self.assertEqual(b1["audio"]["channels"], 1)
@@ -304,6 +327,16 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("<tool_call>", b2["text"])
         self.assertEqual(b2["transcript"], "Ответ студента из тулколла")
         self.assertEqual(b2["feedback"], {"verdict": "partial", "score": 3})
+
+        # 2b. With include_feedback=true and empty transcript in <tool_call>, falls back to STT
+        tool_call_transcript = ""
+        r2_empty = client.post(
+            "/speech-to-speech",
+            files={"file": ("q.wav", audio(), "audio/wav")},
+            data={"include_feedback": "true", "speaker": "ethan"},
+        )
+        self.assertEqual(r2_empty.status_code, 200)
+        self.assertEqual(r2_empty.json()["transcript"], "Ответ студента вслух")
 
         # 3. WAV response_format
         r3 = client.post(
@@ -332,10 +365,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r413_dur.status_code, 413)
         self.assertEqual(r413_dur.json()["error"]["code"], "AUDIO_TOO_LARGE")
 
-        # 413 oversized body
+        # 413 AUDIO_TOO_LARGE when custom normalizer returns raw bytes > 90s
+        async def raw_bytes_normalizer(data):
+            return data
+
+        with TestClient(create_app(transport=httpx.MockTransport(lambda req: httpx.Response(200)), normalizer=raw_bytes_normalizer)) as raw_client:
+            r413_raw = raw_client.post("/transcribe", files={"file": ("long.wav", audio(90.5, sample_rate=8000), "audio/wav")})
+            self.assertEqual(r413_raw.status_code, 413)
+            self.assertEqual(r413_raw.json()["error"]["code"], "AUDIO_TOO_LARGE")
+
+        # 413 oversized body includes Connection: close
         r413_body = client.post("/speech-to-speech", content=bytes(MAX_BODY_BYTES + 1))
         self.assertEqual(r413_body.status_code, 413)
         self.assertEqual(r413_body.json()["error"]["code"], "AUDIO_TOO_LARGE")
+        self.assertEqual(r413_body.headers.get("Connection"), "close")
 
     def test_upstream_errors_and_timeouts(self):
         client_503 = self.client(lambda request: httpx.Response(503))

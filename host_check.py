@@ -76,7 +76,7 @@ def check():
         checked_port = int(port_config["published"])
         with socket.socket() as sock:
             try:
-                sock.bind((port_config.get("host_ip", "0.0.0.0"), checked_port))
+                sock.bind((port_config.get("host_ip") or "0.0.0.0", checked_port))
             except OSError as error:
                 raise RuntimeError(f"Порт {checked_port} занят. Если Omni уже запущен, используйте ./run.sh verify; иначе измените порт в .env.") from error
     report = {"gpu": name, "gpu_id": gpu_id, "driver": driver, **budget,

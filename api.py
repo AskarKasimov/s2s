@@ -214,13 +214,46 @@ def validate_model_name(model: str) -> str:
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: Literal["system", "user", "assistant"]
-    content: str = Field(min_length=1, max_length=32000, strict=True)
+    content: str | list[dict[str, Any]]
+    audio: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def nonblank(self):
-        if not self.content.strip():
-            raise ValueError("Текст сообщения не должен быть пустым.")
+        if isinstance(self.content, str):
+            if not self.content.strip():
+                raise ValueError("Текст сообщения не должен быть пустым.")
+            if len(self.content) > 32000:
+                raise ValueError("Длина сообщения превышает 32 000 символов.")
+        elif isinstance(self.content, list):
+            if not self.content:
+                raise ValueError("Список частей контента сообщения не должен быть пустым.")
+            for part in self.content:
+                if not isinstance(part, dict) or part.get("type") not in ("text", "audio_url"):
+                    raise ValueError("Каждая часть контента должна содержать тип 'text' или 'audio_url'.")
+                if part.get("type") == "text":
+                    text_val = part.get("text")
+                    if not isinstance(text_val, str) or not text_val.strip():
+                        raise ValueError("Текстовая часть сообщения не должна быть пустой.")
+                elif part.get("type") == "audio_url":
+                    audio_url = part.get("audio_url")
+                    if not isinstance(audio_url, dict) or not isinstance(audio_url.get("url"), str) or not audio_url["url"].strip():
+                        raise ValueError("Часть audio_url должна содержать непустое поле url.")
+        else:
+            raise ValueError("Поле content должно быть строкой или списком частей контента.")
         return self
+
+    @property
+    def text_length(self) -> int:
+        if isinstance(self.content, str):
+            return len(self.content)
+        return sum(
+            len(part.get("text", ""))
+            for part in self.content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+
+    def to_engine_dict(self) -> dict[str, Any]:
+        return {"role": self.role, "content": self.content}
 
 
 class ResponseFormatSpec(BaseModel):
@@ -261,7 +294,7 @@ class ChatCompletionRequestModel(BaseModel):
                 "UNSUPPORTED_PARAMETER",
                 'Поддерживаются modalities: ["text"] или ["text", "audio"].',
             )
-        if sum(len(message.content) for message in self.messages) > 48000:
+        if sum(message.text_length for message in self.messages) > 48000:
             raise ValueError("Суммарная длина истории сообщений превышает лимит 48 000 символов.")
         if self.speaker is not None:
             self.speaker = validate_speaker(self.speaker)
@@ -287,7 +320,7 @@ class LegacyChatRequest(BaseModel):
     @model_validator(mode="after")
     def bound_history(self):
         self.model = validate_model_name(self.model)
-        if sum(len(message.content) for message in self.messages) > 48000:
+        if sum(message.text_length for message in self.messages) > 48000:
             raise ValueError("История превышает 48 000 символов.")
         return self
 
@@ -319,7 +352,7 @@ class SynthesizeRequest(BaseModel):
         return validate_speaker(value)
 
 
-def parse_history_messages(raw_messages: str | None) -> list[dict[str, str]]:
+def parse_history_messages(raw_messages: str | None) -> list[dict[str, Any]]:
     if raw_messages is None or not raw_messages.strip():
         return []
     try:
@@ -328,7 +361,7 @@ def parse_history_messages(raw_messages: str | None) -> list[dict[str, str]]:
         raise ApiError(400, "INVALID_REQUEST", "Поле messages должно быть валидной JSON-строкой со списком сообщений.") from error
     if not isinstance(loaded, list):
         raise ApiError(400, "INVALID_REQUEST", "Поле messages должно содержать JSON-массив сообщений.")
-    validated: list[dict[str, str]] = []
+    validated: list[dict[str, Any]] = []
     for item in loaded:
         if not isinstance(item, dict):
             raise ApiError(400, "INVALID_REQUEST", "Каждое сообщение в messages должно быть объектом.")
@@ -336,7 +369,7 @@ def parse_history_messages(raw_messages: str | None) -> list[dict[str, str]]:
             msg = ChatMessage.model_validate(item)
         except Exception as error:
             raise ApiError(400, "INVALID_REQUEST", f"Некорректное сообщение в истории: {error}") from error
-        validated.append(msg.model_dump())
+        validated.append(msg.to_engine_dict())
     return validated
 
 
@@ -353,7 +386,6 @@ def check_upload_format(file: UploadFile) -> None:
         "audio/ogg",
         "audio/opus",
         "audio/webm",
-        " video/webm",
         "video/webm",
         "audio/mpeg",
         "audio/mp3",
@@ -439,6 +471,8 @@ async def read_and_normalize_upload(file: UploadFile, normalizer) -> tuple[bytes
         info = validate_wav(result, max_seconds=MAX_SECONDS)
     except ValueError as error:
         msg = str(error)
+        if "длиннее" in msg:
+            raise ApiError(413, "AUDIO_TOO_LARGE", msg) from error
         if "тишину" in msg or "пустое" in msg:
             raise ApiError(422, "NO_SPEECH_DETECTED", "В аудиозаписи не обнаружена речь (тишина).") from error
         raise ApiError(422, "INVALID_AUDIO", msg) from error
@@ -566,6 +600,7 @@ class AdmissionMiddleware:
                     code,
                     "Превышен максимальный размер тела запроса.",
                     retryable=False,
+                    headers={"Connection": "close"},
                 )
                 return await response(scope, receive, send_with_request_id)
 
@@ -880,7 +915,7 @@ def create_app(
     async def chat_completions(request: Request, body: ChatCompletionRequestModel):
         started, outcome = time.perf_counter(), "error"
         try:
-            messages = [m.model_dump() for m in body.messages]
+            messages = [m.to_engine_dict() for m in body.messages]
             if body.response_format_type == "json_object":
                 messages = [
                     *messages,
@@ -969,6 +1004,7 @@ def create_app(
             return {
                 "id": result.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}",
                 "object": "chat.completion",
+                "created": int(result.get("created") or time.time()),
                 "model": CANONICAL_MODEL_ID,
                 "choices": [
                     {
@@ -991,7 +1027,7 @@ def create_app(
     async def legacy_chat(request: Request, body: LegacyChatRequest):
         started, outcome = time.perf_counter(), "error"
         try:
-            messages = [message.model_dump() for message in body.messages]
+            messages = [message.to_engine_dict() for message in body.messages]
             if body.response_format_type == "json_object":
                 messages = [
                     *messages,
@@ -1217,13 +1253,13 @@ def create_app(
                         raise ApiError(502, "INVALID_MODEL_OUTPUT", "Поле feedback должно быть JSON-объектом.")
                     feedback_obj = feedback_candidate
 
-                if transcript is None:
+                if not transcript:
                     stt_payload = {
                         "model": MODEL,
                         "modalities": ["text"],
                         "stream": False,
                         "temperature": 0.0,
-                        "max_tokens": 512,
+                        "max_tokens": 1024,
                         "messages": [
                             {"role": "system", "content": TRANSCRIBE_SYSTEM_PROMPT},
                             {
