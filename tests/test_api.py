@@ -160,7 +160,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(msg["audio"]["sample_rate"], 24000)
         self.assertEqual(msg["audio"]["channels"], 1)
 
-        # Multimodal input (list of content parts with audio_url) and assistant message with audio in history
+        # Multimodal input (>512 KiB base64 audio_url) and assistant message with audio in history
+        large_audio_b64 = base64.b64encode(audio(15.0)).decode()
+        self.assertGreater(len(large_audio_b64), MAX_CHAT_BODY_BYTES)
         mm_resp = client.post("/v1/chat/completions", json={
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
             "messages": [
@@ -168,7 +170,7 @@ class ApiTests(unittest.TestCase):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + base64.b64encode(audio()).decode()}},
+                        {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + large_audio_b64}},
                         {"type": "text", "text": "Продолжим диалог"},
                     ],
                 },

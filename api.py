@@ -36,6 +36,7 @@ MAX_BODY_BYTES = MAX_FILE_BYTES + 2 * 1024**2
 MAX_SECONDS = 90
 MAX_SYNTHESIZE_CHARS = 500
 MAX_CHAT_BODY_BYTES = 512 * 1024
+MAX_JSON_AUDIO_BYTES = int(MAX_FILE_BYTES * 4 / 3) + 2 * 1024**2
 MAX_CONCURRENT_REQUESTS = int(os.getenv("S2S_MAX_CONCURRENT", "4"))
 MAX_INFLIGHT_REQUESTS = int(os.getenv("S2S_MAX_INFLIGHT_REQUESTS", str(max(MAX_CONCURRENT_REQUESTS * 4, 16))))
 BODY_READ_TIMEOUT = float(os.getenv("S2S_BODY_READ_TIMEOUT", "30.0"))
@@ -542,8 +543,13 @@ class AdmissionMiddleware:
             return await self.app(scope, receive, send_with_request_id)
 
         counter = self.rejected[path]
-        is_json_route = path in ("/chat", "/v1/chat/completions", "/synthesize")
-        limit = MAX_CHAT_BODY_BYTES if is_json_route else MAX_BODY_BYTES
+        is_json_route = path in ("/chat", "/synthesize")
+        if is_json_route:
+            limit = MAX_CHAT_BODY_BYTES
+        elif path == "/v1/chat/completions":
+            limit = MAX_JSON_AUDIO_BYTES
+        else:
+            limit = MAX_BODY_BYTES
 
         if self.inflight >= self.max_inflight:
             counter.labels(outcome="busy").inc()
