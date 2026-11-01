@@ -871,7 +871,14 @@ def create_app(
                 )
             normalized, audio_info = await read_and_normalize_upload(file, normalizer)
             encoded = base64.b64encode(normalized).decode("ascii")
-            lang_hint = "Язык записи: русский (возможны англоязычные термины)." if lang == "ru" else "Определи язык речи автоматически."
+            if lang == "ru":
+                instruction = f"{TRANSCRIBE_SYSTEM_PROMPT} Язык записи: русский (возможны англоязычные термины)."
+            else:
+                instruction = (
+                    TRANSCRIBE_SYSTEM_PROMPT.removesuffix("Верни только распознанный текст речи.")
+                    + 'Определи основной язык речи. Верни только JSON-объект с полями '
+                    '"text" (дословная расшифровка) и "language" (двухбуквенный код ISO 639-1).'
+                )
             payload = {
                 "model": MODEL,
                 "modalities": ["text"],
@@ -879,7 +886,7 @@ def create_app(
                 "temperature": 0.0,
                 "max_tokens": 1024,
                 "messages": [
-                    {"role": "system", "content": f"{TRANSCRIBE_SYSTEM_PROMPT} {lang_hint}"},
+                    {"role": "system", "content": instruction},
                     {
                         "role": "user",
                         "content": [
@@ -897,6 +904,13 @@ def create_app(
                 raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок не вернул текст расшифровки.") from error
             if not isinstance(text, str) or not text.strip():
                 raise ApiError(422, "NO_SPEECH_DETECTED", "В записи не удалось распознать речь.")
+            if lang == "auto":
+                parsed = parse_json_object(text, error_message="Модель не вернула расшифровку и язык в формате JSON.")
+                text, lang = parsed.get("text"), parsed.get("language")
+                if not isinstance(lang, str) or not re.fullmatch(r"[a-z]{2}", lang):
+                    raise ApiError(502, "INVALID_MODEL_OUTPUT", "Модель не вернула корректный код языка.")
+                if not isinstance(text, str) or not text.strip():
+                    raise ApiError(422, "NO_SPEECH_DETECTED", "В записи не удалось распознать речь.")
             outcome = "success"
             return {
                 "text": text.strip(),
@@ -1033,7 +1047,7 @@ def create_app(
                     raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок не вернул аудио для modalities=['text', 'audio'].")
                 try:
                     raw_wav = base64.b64decode(raw_audio_b64, validate=True)
-                except ValueError as error:
+                except (ValueError, TypeError) as error:
                     raise ApiError(502, "INVALID_MODEL_OUTPUT", "Некорректный base64 аудио от движка.") from error
                 clean_wav, wav_meta = ensure_pcm16_wav(raw_wav)
                 assistant_message["audio"] = {

@@ -62,6 +62,27 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(response.status_code, 502)
                     self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
 
+    def test_chat_rejects_non_string_audio_data(self):
+        result = reply()
+        result["choices"][1]["message"]["audio"]["data"] = 42
+        client = self.client(lambda request: httpx.Response(200, json=result))
+        response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Привет"}], "modalities": ["text", "audio"]})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_transcribe_auto_returns_detected_language(self):
+        client = self.client(lambda request: httpx.Response(200, json={"choices": [{"message": {"content": '{"text":"Hello world.","language":"en"}'}}]}))
+        response = client.post("/transcribe", files={"file": ("student.wav", audio(), "audio/wav")}, data={"language": "auto"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["text"], "Hello world.")
+        self.assertEqual(response.json()["language"], "en")
+
+    def test_transcribe_auto_rejects_missing_detected_language(self):
+        client = self.client(lambda request: httpx.Response(200, json={"choices": [{"message": {"content": '{"text":"Hello world."}'}}]}))
+        response = client.post("/transcribe", files={"file": ("student.wav", audio(), "audio/wav")}, data={"language": "auto"})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
     def test_missing_feedback_is_invalid_model_output(self):
         text = 'Реплика.<tool_call>{"transcript":"Ответ"}</tool_call>'
         client = self.client(lambda request: httpx.Response(200, json=reply(text=text)))
