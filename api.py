@@ -139,6 +139,10 @@ def parse_json_object(raw: str, *, error_message: str = "Модель верну
             raise ApiError(502, "INVALID_MODEL_OUTPUT", error_message) from error
     if not isinstance(parsed, dict):
         raise ApiError(502, "INVALID_MODEL_OUTPUT", error_message)
+    try:
+        json.dumps(parsed, allow_nan=False)
+    except ValueError as error:
+        raise ApiError(502, "INVALID_MODEL_OUTPUT", error_message) from error
     return parsed
 
 
@@ -482,8 +486,15 @@ async def read_and_normalize_upload(file: UploadFile, normalizer) -> tuple[bytes
     return result, info
 
 
-async def normalize_message_audio(messages: list[dict[str, Any]], normalizer) -> None:
+async def normalize_message_audio(messages: list[dict[str, Any]], normalizer, *, uploaded_audio: bool = False) -> None:
     """Apply the upload limits to embedded audio before forwarding it to the engine."""
+    audio_count = int(uploaded_audio)
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            audio_count += sum(part.get("type") == "audio_url" for part in content)
+            if audio_count > 1:
+                raise ApiError(400, "UNSUPPORTED_PARAMETER", "Модель поддерживает только одну аудиозапись в запросе.")
     for message in messages:
         content = message.get("content")
         if not isinstance(content, list):
@@ -569,9 +580,9 @@ class AdmissionMiddleware:
 
         counter = self.rejected[path]
         is_json_route = path in ("/chat", "/synthesize")
-        if is_json_route:
+        if path == "/synthesize":
             limit = MAX_CHAT_BODY_BYTES
-        elif path == "/v1/chat/completions":
+        elif path in ("/chat", "/v1/chat/completions"):
             limit = MAX_JSON_AUDIO_BYTES
         else:
             limit = MAX_BODY_BYTES
@@ -1131,7 +1142,7 @@ def create_app(
                     f"Неподдерживаемый response_format '{response_format}'. Допустимы: json_object, text.",
                 )
             history = parse_history_messages(messages)
-            await normalize_message_audio(history, normalizer)
+            await normalize_message_audio(history, normalizer, uploaded_audio=True)
             normalized, _ = await read_and_normalize_upload(file, normalizer)
             encoded = base64.b64encode(normalized).decode("ascii")
 
@@ -1220,7 +1231,7 @@ def create_app(
                 )
 
             history = parse_history_messages(messages)
-            await normalize_message_audio(history, normalizer)
+            await normalize_message_audio(history, normalizer, uploaded_audio=True)
             normalized, _ = await read_and_normalize_upload(file, normalizer)
             encoded = base64.b64encode(normalized).decode("ascii")
 

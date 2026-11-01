@@ -92,6 +92,48 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 502)
                 self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
 
+    def test_multiple_audio_parts_rejected_before_normalization(self):
+        calls = []
+        async def normalizer(data):
+            calls.append(data)
+            return data
+        app = create_app(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=reply())), normalizer=normalizer)
+        part = {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + base64.b64encode(audio()).decode()}}
+        with TestClient(app) as client:
+            response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": [part, part]}]})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(calls, [])
+
+    def test_uploaded_audio_and_history_audio_are_rejected_before_normalization(self):
+        calls = []
+        async def normalizer(data):
+            calls.append(data)
+            return data
+        app = create_app(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=reply())), normalizer=normalizer)
+        part = {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + base64.b64encode(audio()).decode()}}
+        history = json.dumps([{"role": "user", "content": [part]}])
+        with TestClient(app) as client:
+            for route in ("/speech-to-speech", "/analyze-audio"):
+                response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")}, data={"messages": history, "prompt": "Оцени"})
+                self.assertEqual(response.status_code, 400)
+        self.assertEqual(calls, [])
+
+    def test_nonstandard_json_constants_are_rejected(self):
+        for value in ("NaN", "Infinity", "-Infinity", "1e999"):
+            client = self.client(lambda request: httpx.Response(200, json=reply(text='{"value":' + value + '}')))
+            for route in ("/chat", "/v1/chat/completions"):
+                with self.subTest(value=value, route=route):
+                    response = client.post(route, json={"messages": [{"role": "user", "content": "Ответь"}], "response_format": "json_object"})
+                    self.assertEqual(response.status_code, 502)
+
+    def test_legacy_chat_accepts_large_embedded_audio(self):
+        client = self.client(lambda request: httpx.Response(200, json=reply()))
+        encoded = base64.b64encode(audio(15)).decode()
+        self.assertGreater(len(encoded), MAX_CHAT_BODY_BYTES)
+        response = client.post("/chat", json={"messages": [{"role": "user", "content": [
+            {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + encoded}}]}]})
+        self.assertEqual(response.status_code, 200)
+
     def test_request_id_header_propagated_and_generated(self):
         client = self.client(lambda request: httpx.Response(200, json={}))
         resp1 = client.get("/health/live")
