@@ -129,14 +129,8 @@ def parse_json_object(raw: str, *, error_message: str = "Модель верну
     cleaned = strip_markdown_json(raw)
     try:
         parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if not match:
-            raise ApiError(502, "INVALID_MODEL_OUTPUT", error_message)
-        try:
-            parsed = json.loads(match.group(0))
-        except json.JSONDecodeError as error:
-            raise ApiError(502, "INVALID_MODEL_OUTPUT", error_message) from error
+    except json.JSONDecodeError as error:
+        raise ApiError(502, "INVALID_MODEL_OUTPUT", error_message) from error
     if not isinstance(parsed, dict):
         raise ApiError(502, "INVALID_MODEL_OUTPUT", error_message)
     try:

@@ -73,6 +73,15 @@ class ApiTests(unittest.TestCase):
                                        data={"messages": history, "prompt": "Оцени"})
                 self.assertEqual(response.status_code, 400)
 
+    def test_json_object_rejects_embedded_object_in_invalid_output(self):
+        for raw in ('[{"score":3}', 'Ответ: {"score":3}'):
+            client = self.client(lambda request: httpx.Response(200, json=reply(text=raw, finish_reason="length")))
+            for route in ("/chat", "/v1/chat/completions"):
+                with self.subTest(raw=raw, route=route):
+                    response = client.post(route, json={"messages": [{"role": "user", "content": "Ответь"}], "response_format": "json_object"})
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
     def test_truncated_json_output_is_rejected_on_both_chat_routes(self):
         client = self.client(lambda request: httpx.Response(200, json=reply(text='{"answer":', finish_reason="length")))
         for route in ("/chat", "/v1/chat/completions"):
