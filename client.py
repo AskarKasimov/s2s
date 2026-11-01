@@ -42,8 +42,13 @@ def validate_wav(data, *, max_seconds=None):
 def decode_reply(result):
     texts = []
     audio_data = None
-    for choice in result.get("choices", []):
-        message = choice.get("message", {})
+    choices = result.get("choices")
+    if not isinstance(choices, list):
+        raise ValueError("Движок вернул некорректный список ответов.")
+    for choice in choices:
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise ValueError("Движок вернул некорректное сообщение.")
+        message = choice["message"]
         text = message.get("content")
         if isinstance(text, str) and text.strip():
             texts.append(text)

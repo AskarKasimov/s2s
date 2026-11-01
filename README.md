@@ -148,7 +148,7 @@ curl http://localhost:8002/capabilities
 
 ### Распознавание: `POST /transcribe`
 
-Возвращает дословную расшифровку речи (`text`, `language`, `duration_seconds`) без генерации аудио. Запись без речи отклоняется с `422 NO_SPEECH_DETECTED`:
+Возвращает дословную расшифровку речи (`text`, `language`, `duration_seconds`) без генерации аудио. Тишина или пустая расшифровка возвращает `422 NO_SPEECH_DETECTED`. Наличие речи отдельно не проверяется: шум или музыка могут быть переданы модели:
 
 ```bash
 curl -X POST http://localhost:8002/transcribe \
@@ -201,7 +201,7 @@ curl -X POST http://localhost:8002/analyze-audio \
 
 ### Голосовой диалог: `POST /speech-to-speech`
 
-По умолчанию (`response_format=json`) возвращает `transcript`, `text`, `audio` (base64 WAV PCM 16-bit) и `feedback`. При `include_feedback=true` отделяет озвучиваемую реплику от JSON-оценки. При `response_format=wav` возвращает бинарный WAV:
+По умолчанию (`response_format=json`) возвращает `transcript`, `text`, `audio` (base64 WAV PCM 16-bit) и `feedback`. При `include_feedback=true` проверяет JSON-оценку и отделяет её от публичного текста; отделение аудио зависит от поведения движка и отдельно не проверяется. При `response_format=wav` возвращает бинарный WAV:
 
 ```bash
 curl -X POST http://localhost:8002/speech-to-speech \

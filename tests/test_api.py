@@ -43,6 +43,25 @@ class ApiTests(unittest.TestCase):
         self.addCleanup(client.__exit__, None, None, None)
         return client
 
+    def test_wav_feedback_requires_valid_tool_call(self):
+        for text in ("Ответ без блока оценки.", 'Ответ.<tool_call>{"transcript":"Ответ"}</tool_call>'):
+            with self.subTest(text=text):
+                client = self.client(lambda request: httpx.Response(200, json=reply(text=text)))
+                response = client.post("/speech-to-speech", files={"file": ("q.wav", audio(), "audio/wav")},
+                                       data={"include_feedback": "true", "response_format": "wav"})
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_malformed_audio_engine_response_returns_502(self):
+        for result in ({"choices": [None]}, {"choices": [{"message": None}]}):
+            with self.subTest(result=result):
+                client = self.client(lambda request: httpx.Response(200, json=result))
+                for route, kwargs in (("/synthesize", {"json": {"text": "Привет"}}),
+                                      ("/speech-to-speech", {"files": {"file": ("q.wav", audio(), "audio/wav")}})):
+                    response = client.post(route, **kwargs)
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
     def test_missing_feedback_is_invalid_model_output(self):
         text = 'Реплика.<tool_call>{"transcript":"Ответ"}</tool_call>'
         client = self.client(lambda request: httpx.Response(200, json=reply(text=text)))

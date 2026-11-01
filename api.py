@@ -1278,14 +1278,6 @@ def create_app(
                 if not spoken_text:
                     raise ApiError(502, "INVALID_MODEL_OUTPUT", "Публичная текстовая реплика пуста после отделения <tool_call>.")
 
-                if effective_format == "wav":
-                    outcome = "success"
-                    return Response(
-                        clean_audio,
-                        media_type="audio/wav",
-                        headers={"Content-Disposition": 'attachment; filename="answer.wav"'},
-                    )
-
                 transcript: str | None = None
                 feedback_obj: dict[str, Any] | None = None
                 if include_feedback:
@@ -1301,6 +1293,14 @@ def create_app(
                     if not isinstance(feedback_candidate, dict):
                         raise ApiError(502, "INVALID_MODEL_OUTPUT", "Поле feedback должно быть JSON-объектом.")
                     feedback_obj = feedback_candidate
+
+                if effective_format == "wav":
+                    outcome = "success"
+                    return Response(
+                        clean_audio,
+                        media_type="audio/wav",
+                        headers={"Content-Disposition": 'attachment; filename="answer.wav"'},
+                    )
 
                 if not transcript:
                     stt_payload = {
