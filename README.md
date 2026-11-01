@@ -14,7 +14,6 @@ HTTP API распознавания речи, синтеза, анализа у�
 ```bash
 git clone https://github.com/AskarKasimov/s2s.git
 cd s2s
-git checkout feat/qwen3-omni-speech-to-speech
 cp -n .env.example .env
 ```
 
@@ -145,9 +144,11 @@ curl http://localhost:8002/capabilities
 
 Все ручки работают через один запущенный экземпляр модели (до 4 параллельных генераций одновременно; при превышении возвращается `429 QUEUE_FULL` с заголовком `Retry-After: 5`). Входное аудио: WAV, Ogg/Opus, WebM/Opus, MP3, FLAC до 25 МиБ и до 90 секунд. Подробные схемы — в [API.md](API.md), Swagger UI — `http://<адрес-сервера>:8002/docs`.
 
+Контекстное окно модели — 4096 токенов на вход и ответ вместе; текст, аудио и служебное оформление сообщений занимают часть окна. Длинную историю или аудио может потребоваться сократить. При превышении входного контекста движок отклоняет запрос.
+
 ### Распознавание: `POST /transcribe`
 
-Возвращает дословную расшифровку речи (`text`, `language`, `duration_seconds`) без генерации аудио. Запись без речи отклоняется с `422 NO_SPEECH_DETECTED`:
+Возвращает дословную расшифровку речи (`text`, `language`, `duration_seconds`) без генерации аудио. Тишина или пустая расшифровка возвращает `422 NO_SPEECH_DETECTED`. Наличие речи отдельно не проверяется: шум или музыка могут быть переданы модели. При `language=auto` язык определяет модель; результат может быть неточным:
 
 ```bash
 curl -X POST http://localhost:8002/transcribe \
@@ -157,7 +158,7 @@ curl -X POST http://localhost:8002/transcribe \
 
 ### Синтез речи: `POST /synthesize`
 
-Дословно озвучивает переданный текст (до 500 символов). Голоса (`speaker`): `ethan` (по умолчанию), `chelsie`, `aiden`. Формат ответа (`response_format`): `wav` или `json`:
+Экспериментальная ручка просит модель дословно озвучить переданный текст (до 500 символов), но соответствие полученной речи не проверяется: модель может изменить или дополнить текст. Голоса (`speaker`): `ethan` (по умолчанию), `chelsie`, `aiden`. Формат ответа (`response_format`): `wav` или `json`:
 
 ```bash
 curl -X POST http://localhost:8002/synthesize \
@@ -200,7 +201,7 @@ curl -X POST http://localhost:8002/analyze-audio \
 
 ### Голосовой диалог: `POST /speech-to-speech`
 
-По умолчанию (`response_format=json`) возвращает `transcript`, `text`, `audio` (base64 WAV PCM 16-bit) и `feedback`. При `include_feedback=true` отделяет озвучиваемую реплику от JSON-оценки. При `response_format=wav` возвращает бинарный WAV:
+По умолчанию (`response_format=json`) возвращает `transcript`, `text`, `audio` (base64 WAV PCM 16-bit) и `feedback`. При `include_feedback=true` проверяет JSON-оценку и отделяет её от публичного текста; отделение аудио зависит от поведения движка и отдельно не проверяется. При `response_format=wav` возвращает бинарный WAV:
 
 ```bash
 curl -X POST http://localhost:8002/speech-to-speech \

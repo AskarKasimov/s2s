@@ -43,6 +43,189 @@ class ApiTests(unittest.TestCase):
         self.addCleanup(client.__exit__, None, None, None)
         return client
 
+    def test_wav_feedback_requires_valid_tool_call(self):
+        for text in ("Ответ без блока оценки.", 'Ответ.<tool_call>{"transcript":"Ответ"}</tool_call>'):
+            with self.subTest(text=text):
+                client = self.client(lambda request: httpx.Response(200, json=reply(text=text)))
+                response = client.post("/speech-to-speech", files={"file": ("q.wav", audio(), "audio/wav")},
+                                       data={"include_feedback": "true", "response_format": "wav"})
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_malformed_audio_engine_response_returns_502(self):
+        for result in ({"choices": [None]}, {"choices": [{"message": None}]}):
+            with self.subTest(result=result):
+                client = self.client(lambda request: httpx.Response(200, json=result))
+                for route, kwargs in (("/synthesize", {"json": {"text": "Привет"}}),
+                                      ("/speech-to-speech", {"files": {"file": ("q.wav", audio(), "audio/wav")}})):
+                    response = client.post(route, **kwargs)
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_chat_rejects_non_string_audio_data(self):
+        result = reply()
+        result["choices"][1]["message"]["audio"]["data"] = 42
+        client = self.client(lambda request: httpx.Response(200, json=result))
+        response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Привет"}], "modalities": ["text", "audio"]})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_transcribe_auto_returns_detected_language(self):
+        client = self.client(lambda request: httpx.Response(200, json={"choices": [{"message": {"content": '{"text":"Hello world.","language":"en"}'}}]}))
+        response = client.post("/transcribe", files={"file": ("student.wav", audio(), "audio/wav")}, data={"language": "auto"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["text"], "Hello world.")
+        self.assertEqual(response.json()["language"], "en")
+
+    def test_transcribe_auto_rejects_missing_detected_language(self):
+        client = self.client(lambda request: httpx.Response(200, json={"choices": [{"message": {"content": '{"text":"Hello world."}'}}]}))
+        response = client.post("/transcribe", files={"file": ("student.wav", audio(), "audio/wav")}, data={"language": "auto"})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_missing_feedback_is_invalid_model_output(self):
+        text = 'Реплика.<tool_call>{"transcript":"Ответ"}</tool_call>'
+        client = self.client(lambda request: httpx.Response(200, json=reply(text=text)))
+        response = client.post("/speech-to-speech", files={"file": ("q.wav", audio(), "audio/wav")}, data={"include_feedback": "true"})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_malformed_engine_message_is_invalid_model_output(self):
+        client = self.client(lambda request: httpx.Response(200, json={"choices": [{"message": "invalid"}]}))
+        response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Привет"}]})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_message_audio_field_is_rejected_on_all_routes(self):
+        client = self.client(lambda request: self.fail("Не следует вызывать модель"))
+        message = {"role": "user", "content": "Привет", "audio": {"data": "abc"}}
+        for route in ("/chat", "/v1/chat/completions"):
+            with self.subTest(route=route):
+                response = client.post(route, json={"messages": [message]})
+                self.assertEqual(response.status_code, 400)
+        for route in ("/analyze-audio", "/speech-to-speech"):
+            with self.subTest(route=route):
+                response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")}, data={"messages": json.dumps([message]), "prompt": "Оцени"})
+                self.assertEqual(response.status_code, 400)
+
+    def test_assistant_audio_can_be_reused_in_history(self):
+        seen = []
+        def engine(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json=reply())
+        client = self.client(engine)
+        message = {"role": "assistant", "content": "Привет", "audio": {"data": "abc", "format": "wav"}}
+        for route in ("/chat", "/v1/chat/completions"):
+            with self.subTest(route=route):
+                response = client.post(route, json={"messages": [message]})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(seen[-1]["messages"][0], {"role": "assistant", "content": "Привет"})
+        for route in ("/analyze-audio", "/speech-to-speech"):
+            with self.subTest(route=route):
+                response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")}, data={"messages": json.dumps([message]), "prompt": "Оцени"})
+                self.assertNotEqual(response.status_code, 400)
+                self.assertNotIn("audio", seen[-1]["messages"][1])
+
+    def test_chat_audio_is_validated_and_normalized(self):
+        seen = []
+        def engine(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json=reply())
+        client = self.client(engine)
+        def send(url, route="/v1/chat/completions"):
+            return client.post(route, json={"messages": [{"role": "user", "content": [
+                {"type": "audio_url", "audio_url": {"url": url}}]}]})
+        self.assertEqual(send("http://internal/audio.wav").status_code, 400)
+        self.assertEqual(send("data:audio/wav;base64,not-base64!").status_code, 422)
+        long_audio = "data:audio/wav;base64," + base64.b64encode(audio(91, sample_rate=16000)).decode()
+        self.assertEqual(send(long_audio).status_code, 413)
+        valid = "data:audio/wav;base64," + base64.b64encode(audio()).decode()
+        self.assertEqual(send(valid, "/chat").status_code, 200)
+        result = seen[-1]["messages"][0]["content"][0]["audio_url"]["url"]
+        with wave.open(io.BytesIO(base64.b64decode(result.split(",", 1)[1])), "rb") as wav:
+            self.assertEqual(wav.getframerate(), 16000)
+        self.assertEqual(len(seen), 1)
+
+    def test_audio_in_form_history_cannot_bypass_validation(self):
+        client = self.client(lambda request: self.fail("Не следует вызывать модель"))
+        history = json.dumps([{"role": "user", "content": [
+            {"type": "audio_url", "audio_url": {"url": "http://internal/audio.wav"}}]}])
+        for route in ("/analyze-audio", "/speech-to-speech"):
+            with self.subTest(route=route):
+                response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")},
+                                       data={"messages": history, "prompt": "Оцени"})
+                self.assertEqual(response.status_code, 400)
+
+    def test_json_object_rejects_embedded_object_in_invalid_output(self):
+        for raw in ('[{"score":3}', 'Ответ: {"score":3}'):
+            client = self.client(lambda request: httpx.Response(200, json=reply(text=raw, finish_reason="length")))
+            for route in ("/chat", "/v1/chat/completions"):
+                with self.subTest(raw=raw, route=route):
+                    response = client.post(route, json={"messages": [{"role": "user", "content": "Ответь"}], "response_format": "json_object"})
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_truncated_json_output_is_rejected_on_both_chat_routes(self):
+        client = self.client(lambda request: httpx.Response(200, json=reply(text='{"answer":', finish_reason="length")))
+        for route in ("/chat", "/v1/chat/completions"):
+            with self.subTest(route=route):
+                response = client.post(route, json={"messages": [{"role": "user", "content": "Ответь"}], "response_format": "json_object"})
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_speech_to_speech_rejects_empty_or_missing_transcript(self):
+        for stt_response in ({"choices": []}, {"choices": [{"message": {"content": "  "}}]}):
+            def engine(request):
+                payload = json.loads(request.content)
+                return httpx.Response(200, json=stt_response if payload["modalities"] == ["text"] else reply())
+            with self.subTest(stt_response=stt_response):
+                client = self.client(engine)
+                response = client.post("/speech-to-speech", files={"file": ("q.wav", audio(), "audio/wav")})
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_multiple_audio_parts_rejected_before_normalization(self):
+        calls = []
+        async def normalizer(data):
+            calls.append(data)
+            return data
+        app = create_app(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=reply())), normalizer=normalizer)
+        part = {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + base64.b64encode(audio()).decode()}}
+        with TestClient(app) as client:
+            response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": [part, part]}]})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(calls, [])
+
+    def test_uploaded_audio_and_history_audio_are_rejected_before_normalization(self):
+        calls = []
+        async def normalizer(data):
+            calls.append(data)
+            return data
+        app = create_app(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=reply())), normalizer=normalizer)
+        part = {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + base64.b64encode(audio()).decode()}}
+        history = json.dumps([{"role": "user", "content": [part]}])
+        with TestClient(app) as client:
+            for route in ("/speech-to-speech", "/analyze-audio"):
+                response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")}, data={"messages": history, "prompt": "Оцени"})
+                self.assertEqual(response.status_code, 400)
+        self.assertEqual(calls, [])
+
+    def test_nonstandard_json_constants_are_rejected(self):
+        for value in ("NaN", "Infinity", "-Infinity", "1e999"):
+            client = self.client(lambda request: httpx.Response(200, json=reply(text='{"value":' + value + '}')))
+            for route in ("/chat", "/v1/chat/completions"):
+                with self.subTest(value=value, route=route):
+                    response = client.post(route, json={"messages": [{"role": "user", "content": "Ответь"}], "response_format": "json_object"})
+                    self.assertEqual(response.status_code, 502)
+
+    def test_legacy_chat_accepts_large_embedded_audio(self):
+        client = self.client(lambda request: httpx.Response(200, json=reply()))
+        encoded = base64.b64encode(audio(15)).decode()
+        self.assertGreater(len(encoded), MAX_CHAT_BODY_BYTES)
+        response = client.post("/chat", json={"messages": [{"role": "user", "content": [
+            {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + encoded}}]}]})
+        self.assertEqual(response.status_code, 200)
+
     def test_request_id_header_propagated_and_generated(self):
         client = self.client(lambda request: httpx.Response(200, json={}))
         resp1 = client.get("/health/live")
@@ -160,13 +343,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(msg["audio"]["sample_rate"], 24000)
         self.assertEqual(msg["audio"]["channels"], 1)
 
-        # Multimodal input (>512 KiB base64 audio_url) and assistant message with audio in history
+        # Multimodal input (>512 KiB base64 audio_url) and assistant text in history
         large_audio_b64 = base64.b64encode(audio(15.0)).decode()
         self.assertGreater(len(large_audio_b64), MAX_CHAT_BODY_BYTES)
         mm_resp = client.post("/v1/chat/completions", json={
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
             "messages": [
-                msg,
+                {"role": msg["role"], "content": msg["content"]},
                 {
                     "role": "user",
                     "content": [
@@ -398,6 +581,19 @@ class ApiTests(unittest.TestCase):
         r504 = self.client(timeout_engine).post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Тест"}]})
         self.assertEqual(r504.status_code, 504)
         self.assertEqual(r504.json()["error"]["code"], "INFERENCE_TIMEOUT")
+
+    def test_context_limit_error_is_actionable_on_both_chat_routes(self):
+        client = self.client(lambda request: httpx.Response(400, json={
+            "error": {"message": "Input length (4200) exceeds model's maximum context length (4096).", "type": "BadRequestError", "code": 400}
+        }))
+        for path in ("/chat", "/v1/chat/completions"):
+            with self.subTest(path=path):
+                response = client.post(path, json={"messages": [{"role": "user", "content": "Тест"}]})
+                self.assertEqual(response.status_code, 400)
+                error = response.json()["error"]
+                self.assertEqual(error["code"], "CONTEXT_LENGTH_EXCEEDED")
+                self.assertIn("4096", error["message"])
+                self.assertFalse(error["retryable"])
 
     def test_busy_admission_and_release(self):
         async def check():
