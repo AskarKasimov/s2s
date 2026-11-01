@@ -482,6 +482,31 @@ async def read_and_normalize_upload(file: UploadFile, normalizer) -> tuple[bytes
     return result, info
 
 
+async def normalize_message_audio(messages: list[dict[str, Any]], normalizer) -> None:
+    """Apply the upload limits to embedded audio before forwarding it to the engine."""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if part.get("type") != "audio_url":
+                continue
+            url = part["audio_url"]["url"]
+            match = re.fullmatch(r"data:(audio/(?:wav|x-wav|wave|ogg|opus|webm|mpeg|mp3|flac|x-flac)|video/webm);base64,(.*)", url, re.DOTALL | re.IGNORECASE)
+            if not match:
+                raise ApiError(400, "UNSUPPORTED_PARAMETER", "Аудио должно быть встроено в data URL с поддерживаемым форматом.")
+            encoded = match.group(2)
+            if len(encoded) > 4 * ((MAX_FILE_BYTES + 2) // 3):
+                raise ApiError(413, "AUDIO_TOO_LARGE", "Превышен лимит размера аудиофайла (25 МиБ).")
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except ValueError as error:
+                raise ApiError(422, "INVALID_AUDIO", "Некорректный base64 аудио.") from error
+            upload = UploadFile(file=io.BytesIO(data), filename="audio", headers=None)
+            normalized, _ = await read_and_normalize_upload(upload, normalizer)
+            part["audio_url"] = {"url": "data:audio/wav;base64," + base64.b64encode(normalized).decode("ascii")}
+
+
 async def post_with_disconnect_cancel(request: Request, client: httpx.AsyncClient, url: str, payload: dict[str, Any]) -> httpx.Response:
     post_task = asyncio.create_task(client.post(url, json=payload))
     try:
@@ -922,6 +947,7 @@ def create_app(
         started, outcome = time.perf_counter(), "error"
         try:
             messages = [m.to_engine_dict() for m in body.messages]
+            await normalize_message_audio(messages, normalizer)
             if body.response_format_type == "json_object":
                 messages = [
                     *messages,
@@ -972,14 +998,11 @@ def create_app(
 
             if body.response_format_type == "json_object":
                 cleaned_text = strip_markdown_json(combined_text)
-                if finish_reason != "length":
-                    parsed_obj = parse_json_object(
-                        cleaned_text,
-                        error_message="В режиме json_object модель вернула невалидный JSON.",
-                    )
-                    combined_text = json.dumps(parsed_obj, ensure_ascii=False)
-                else:
-                    combined_text = cleaned_text
+                parsed_obj = parse_json_object(
+                    cleaned_text,
+                    error_message="В режиме json_object модель вернула невалидный JSON.",
+                )
+                combined_text = json.dumps(parsed_obj, ensure_ascii=False)
 
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
@@ -1034,6 +1057,7 @@ def create_app(
         started, outcome = time.perf_counter(), "error"
         try:
             messages = [message.to_engine_dict() for message in body.messages]
+            await normalize_message_audio(messages, normalizer)
             if body.response_format_type == "json_object":
                 messages = [
                     *messages,
@@ -1063,14 +1087,11 @@ def create_app(
 
             if body.response_format_type == "json_object":
                 cleaned_text = strip_markdown_json(text)
-                if finish_reason != "length":
-                    parsed_obj = parse_json_object(
-                        cleaned_text,
-                        error_message="В режиме json_object модель вернула невалидный JSON.",
-                    )
-                    text = json.dumps(parsed_obj, ensure_ascii=False)
-                else:
-                    text = cleaned_text
+                parsed_obj = parse_json_object(
+                    cleaned_text,
+                    error_message="В режиме json_object модель вернула невалидный JSON.",
+                )
+                text = json.dumps(parsed_obj, ensure_ascii=False)
 
             outcome = "success"
             answer: dict[str, Any] = {
@@ -1110,6 +1131,7 @@ def create_app(
                     f"Неподдерживаемый response_format '{response_format}'. Допустимы: json_object, text.",
                 )
             history = parse_history_messages(messages)
+            await normalize_message_audio(history, normalizer)
             normalized, _ = await read_and_normalize_upload(file, normalizer)
             encoded = base64.b64encode(normalized).decode("ascii")
 
@@ -1198,6 +1220,7 @@ def create_app(
                 )
 
             history = parse_history_messages(messages)
+            await normalize_message_audio(history, normalizer)
             normalized, _ = await read_and_normalize_upload(file, normalizer)
             encoded = base64.b64encode(normalized).decode("ascii")
 
@@ -1284,6 +1307,8 @@ def create_app(
                         transcript = stt_text.strip() if isinstance(stt_text, str) else ""
                     except (KeyError, IndexError, TypeError):
                         transcript = ""
+                    if not transcript:
+                        raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок не вернул расшифровку аудио.")
 
             outcome = "success"
             return {

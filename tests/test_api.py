@@ -43,6 +43,55 @@ class ApiTests(unittest.TestCase):
         self.addCleanup(client.__exit__, None, None, None)
         return client
 
+    def test_chat_audio_is_validated_and_normalized(self):
+        seen = []
+        def engine(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json=reply())
+        client = self.client(engine)
+        def send(url, route="/v1/chat/completions"):
+            return client.post(route, json={"messages": [{"role": "user", "content": [
+                {"type": "audio_url", "audio_url": {"url": url}}]}]})
+        self.assertEqual(send("http://internal/audio.wav").status_code, 400)
+        self.assertEqual(send("data:audio/wav;base64,not-base64!").status_code, 422)
+        long_audio = "data:audio/wav;base64," + base64.b64encode(audio(91, sample_rate=16000)).decode()
+        self.assertEqual(send(long_audio).status_code, 413)
+        valid = "data:audio/wav;base64," + base64.b64encode(audio()).decode()
+        self.assertEqual(send(valid, "/chat").status_code, 200)
+        result = seen[-1]["messages"][0]["content"][0]["audio_url"]["url"]
+        with wave.open(io.BytesIO(base64.b64decode(result.split(",", 1)[1])), "rb") as wav:
+            self.assertEqual(wav.getframerate(), 16000)
+        self.assertEqual(len(seen), 1)
+
+    def test_audio_in_form_history_cannot_bypass_validation(self):
+        client = self.client(lambda request: self.fail("Не следует вызывать модель"))
+        history = json.dumps([{"role": "user", "content": [
+            {"type": "audio_url", "audio_url": {"url": "http://internal/audio.wav"}}]}])
+        for route in ("/analyze-audio", "/speech-to-speech"):
+            with self.subTest(route=route):
+                response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")},
+                                       data={"messages": history, "prompt": "Оцени"})
+                self.assertEqual(response.status_code, 400)
+
+    def test_truncated_json_output_is_rejected_on_both_chat_routes(self):
+        client = self.client(lambda request: httpx.Response(200, json=reply(text='{"answer":', finish_reason="length")))
+        for route in ("/chat", "/v1/chat/completions"):
+            with self.subTest(route=route):
+                response = client.post(route, json={"messages": [{"role": "user", "content": "Ответь"}], "response_format": "json_object"})
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_speech_to_speech_rejects_empty_or_missing_transcript(self):
+        for stt_response in ({"choices": []}, {"choices": [{"message": {"content": "  "}}]}):
+            def engine(request):
+                payload = json.loads(request.content)
+                return httpx.Response(200, json=stt_response if payload["modalities"] == ["text"] else reply())
+            with self.subTest(stt_response=stt_response):
+                client = self.client(engine)
+                response = client.post("/speech-to-speech", files={"file": ("q.wav", audio(), "audio/wav")})
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
     def test_request_id_header_propagated_and_generated(self):
         client = self.client(lambda request: httpx.Response(200, json={}))
         resp1 = client.get("/health/live")
