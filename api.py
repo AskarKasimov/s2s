@@ -214,9 +214,12 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: Literal["system", "user", "assistant"]
     content: str | list[dict[str, Any]]
+    audio: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def nonblank(self):
+        if "audio" in self.model_fields_set and self.role != "assistant":
+            raise ValueError("Поле audio поддерживается только в истории ассистента.")
         if isinstance(self.content, str):
             if not self.content.strip():
                 raise ValueError("Текст сообщения не должен быть пустым.")

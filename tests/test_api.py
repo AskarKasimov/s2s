@@ -68,6 +68,24 @@ class ApiTests(unittest.TestCase):
                 response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")}, data={"messages": json.dumps([message]), "prompt": "Оцени"})
                 self.assertEqual(response.status_code, 400)
 
+    def test_assistant_audio_can_be_reused_in_history(self):
+        seen = []
+        def engine(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json=reply())
+        client = self.client(engine)
+        message = {"role": "assistant", "content": "Привет", "audio": {"data": "abc", "format": "wav"}}
+        for route in ("/chat", "/v1/chat/completions"):
+            with self.subTest(route=route):
+                response = client.post(route, json={"messages": [message]})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(seen[-1]["messages"][0], {"role": "assistant", "content": "Привет"})
+        for route in ("/analyze-audio", "/speech-to-speech"):
+            with self.subTest(route=route):
+                response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")}, data={"messages": json.dumps([message]), "prompt": "Оцени"})
+                self.assertNotEqual(response.status_code, 400)
+                self.assertNotIn("audio", seen[-1]["messages"][1])
+
     def test_chat_audio_is_validated_and_normalized(self):
         seen = []
         def engine(request):
