@@ -157,7 +157,7 @@ curl -X POST http://localhost:8002/transcribe \
 
 ### Синтез речи: `POST /synthesize`
 
-Дословно озвучивает переданный текст (до 500 символов). Голоса (`speaker`): `ethan` (по умолчанию), `chelsie`, `aiden`. Формат ответа (`response_format`): `wav` или `json`:
+Экспериментальная ручка просит модель дословно озвучить переданный текст (до 500 символов), но соответствие полученной речи не проверяется: модель может изменить или дополнить текст. Голоса (`speaker`): `ethan` (по умолчанию), `chelsie`, `aiden`. Формат ответа (`response_format`): `wav` или `json`:
 
 ```bash
 curl -X POST http://localhost:8002/synthesize \

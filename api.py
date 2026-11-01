@@ -214,7 +214,6 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: Literal["system", "user", "assistant"]
     content: str | list[dict[str, Any]]
-    audio: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def nonblank(self):
@@ -989,7 +988,9 @@ def create_app(
                     finish_reason = "length"
                 elif choice.get("finish_reason") and finish_reason == "stop":
                     finish_reason = str(choice["finish_reason"])
-                msg = choice.get("message") or {}
+                msg = choice.get("message")
+                if not isinstance(msg, dict):
+                    raise ApiError(502, "INVALID_MODEL_OUTPUT", "Движок вернул некорректное сообщение.")
                 content = msg.get("content")
                 if isinstance(content, str) and content.strip():
                     text_parts.append(content)
@@ -1283,7 +1284,7 @@ def create_app(
                         )
                     if isinstance(tool_payload.get("transcript"), str):
                         transcript = tool_payload["transcript"].strip()
-                    feedback_candidate = tool_payload.get("feedback", tool_payload)
+                    feedback_candidate = tool_payload.get("feedback")
                     if not isinstance(feedback_candidate, dict):
                         raise ApiError(502, "INVALID_MODEL_OUTPUT", "Поле feedback должно быть JSON-объектом.")
                     feedback_obj = feedback_candidate

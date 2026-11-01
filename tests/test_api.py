@@ -43,6 +43,31 @@ class ApiTests(unittest.TestCase):
         self.addCleanup(client.__exit__, None, None, None)
         return client
 
+    def test_missing_feedback_is_invalid_model_output(self):
+        text = 'Реплика.<tool_call>{"transcript":"Ответ"}</tool_call>'
+        client = self.client(lambda request: httpx.Response(200, json=reply(text=text)))
+        response = client.post("/speech-to-speech", files={"file": ("q.wav", audio(), "audio/wav")}, data={"include_feedback": "true"})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_malformed_engine_message_is_invalid_model_output(self):
+        client = self.client(lambda request: httpx.Response(200, json={"choices": [{"message": "invalid"}]}))
+        response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Привет"}]})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL_OUTPUT")
+
+    def test_message_audio_field_is_rejected_on_all_routes(self):
+        client = self.client(lambda request: self.fail("Не следует вызывать модель"))
+        message = {"role": "user", "content": "Привет", "audio": {"data": "abc"}}
+        for route in ("/chat", "/v1/chat/completions"):
+            with self.subTest(route=route):
+                response = client.post(route, json={"messages": [message]})
+                self.assertEqual(response.status_code, 400)
+        for route in ("/analyze-audio", "/speech-to-speech"):
+            with self.subTest(route=route):
+                response = client.post(route, files={"file": ("q.wav", audio(), "audio/wav")}, data={"messages": json.dumps([message]), "prompt": "Оцени"})
+                self.assertEqual(response.status_code, 400)
+
     def test_chat_audio_is_validated_and_normalized(self):
         seen = []
         def engine(request):
@@ -260,13 +285,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(msg["audio"]["sample_rate"], 24000)
         self.assertEqual(msg["audio"]["channels"], 1)
 
-        # Multimodal input (>512 KiB base64 audio_url) and assistant message with audio in history
+        # Multimodal input (>512 KiB base64 audio_url) and assistant text in history
         large_audio_b64 = base64.b64encode(audio(15.0)).decode()
         self.assertGreater(len(large_audio_b64), MAX_CHAT_BODY_BYTES)
         mm_resp = client.post("/v1/chat/completions", json={
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
             "messages": [
-                msg,
+                {"role": msg["role"], "content": msg["content"]},
                 {
                     "role": "user",
                     "content": [
