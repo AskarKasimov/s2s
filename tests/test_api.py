@@ -542,6 +542,19 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r504.status_code, 504)
         self.assertEqual(r504.json()["error"]["code"], "INFERENCE_TIMEOUT")
 
+    def test_context_limit_error_is_actionable_on_both_chat_routes(self):
+        client = self.client(lambda request: httpx.Response(400, json={
+            "error": {"message": "Input length (4200) exceeds model's maximum context length (4096).", "type": "BadRequestError", "code": 400}
+        }))
+        for path in ("/chat", "/v1/chat/completions"):
+            with self.subTest(path=path):
+                response = client.post(path, json={"messages": [{"role": "user", "content": "Тест"}]})
+                self.assertEqual(response.status_code, 400)
+                error = response.json()["error"]
+                self.assertEqual(error["code"], "CONTEXT_LENGTH_EXCEEDED")
+                self.assertIn("4096", error["message"])
+                self.assertFalse(error["retryable"])
+
     def test_busy_admission_and_release(self):
         async def check():
             entered, release = asyncio.Event(), asyncio.Event()

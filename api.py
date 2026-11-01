@@ -771,6 +771,16 @@ def create_app(
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
             if status in (400, 422):
+                try:
+                    detail = error.response.json().get("error", {})
+                    message = detail.get("message", "") if isinstance(detail, dict) else ""
+                except (ValueError, AttributeError):
+                    message = ""
+                if isinstance(message, str) and "context length" in message.lower():
+                    raise ApiError(
+                        400, "CONTEXT_LENGTH_EXCEEDED",
+                        "Превышено контекстное окно модели (4096 токенов). Сократите историю, текст или аудио и повторите запрос.",
+                    ) from error
                 raise ApiError(400, "INVALID_REQUEST", "Модель отклонила запрос (проверьте длину истории или параметры).") from error
             if status == 503:
                 raise ApiError(503, "MODEL_NOT_READY", "Движок модели ещё не готов.", retryable=True) from error
